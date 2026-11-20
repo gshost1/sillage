@@ -259,6 +259,8 @@ pub fn ranked(id: u32, tree: SimplifiedTree, fq: &FeatureBag, fz: &dyn Featurize
         id: MethodId(id),
         overlap: 0,
         sim: pruned.sim,
+        full_sim: 0,
+        size: 0,
         score: if total == 0 { 0.0 } else { pruned.sim as f64 / total as f64 },
         pruned,
         tree,

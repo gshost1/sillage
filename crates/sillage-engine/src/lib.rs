@@ -12,7 +12,7 @@ pub use cluster::{ScoredCluster, cluster, cluster_scored};
 pub use complete::complete_calls;
 pub use intersect::intersect;
 pub use prune::{prune, prune_keep};
-pub use rerank::{rerank, rerank_top};
+pub use rerank::{TieKey, no_full_bound, rerank, rerank_top};
 
 use serde::{Deserialize, Serialize};
 use sillage_core::{Featurizer, MethodId, Params, SimplifiedTree};
@@ -28,11 +28,25 @@ pub struct Pruned {
 #[derive(Debug, Clone)]
 pub struct Ranked {
     pub id: MethodId,
+    /// Phase I set overlap `|S(F(q)) ∩ S(F(m))|`.
     pub overlap: u32,
+    /// Pruned similarity (the Phase II score's numerator).
     pub sim: u64,
+    /// Tie-breaker: `|F_full(q) ∩ F(m)|`, the multiset overlap of the method with
+    /// the query's *full* featurization (cross-line features included).
+    pub full_sim: u64,
+    /// Tie-breaker: `|F(m)|`, the method's feature count.
+    pub size: u64,
     pub score: f64,
     pub pruned: Pruned,
     pub tree: SimplifiedTree,
+}
+
+impl Ranked {
+    /// This entry's Phase II ranking key.
+    pub fn key(&self) -> TieKey {
+        TieKey { sim: self.sim, overlap: self.overlap, full_sim: self.full_sim, size: self.size, id: self.id }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -26,6 +26,9 @@ pub struct Hit {
     /// Multiset overlap `Σ_f min(q_f, m_f)` (with saturated counts treated as
     /// unbounded), an upper bound on `SimScore(F(q), F(Prune(F(q), m)))`.
     pub bound: u64,
+    /// `|F(m)|` as stored at build time: a lower bound on the method's feature
+    /// count (exact unless several bags were merged into one ID).
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +42,38 @@ pub struct InvertedIndex {
     /// `counts[p]` is the multiplicity of the feature in method `postings[p]`,
     /// saturated at [`COUNT_SAT`].
     counts: Vec<u8>,
+    /// `sizes[m]` is `|F(m)|`, the method's total feature count (0 for a method
+    /// that does not parse, and for an ID built from several bags): a lower
+    /// bound on the size the engine computes after re-parsing it.
+    sizes: Vec<u32>,
     num_methods: u32,
+}
+
+/// A query whose feature ranges are resolved once, for per-method multiset
+/// bounds ([`InvertedIndex::resolve`]).
+#[derive(Debug, Clone)]
+pub struct ResolvedQuery<'a> {
+    index: &'a InvertedIndex,
+    /// `(posting range, query count)` per query feature present in the index.
+    ranges: Vec<(std::ops::Range<usize>, u32)>,
+}
+
+impl ResolvedQuery<'_> {
+    /// `Σ_f min(q_f, m_f)` for method `id` (saturated counts treated as
+    /// unbounded): an upper bound on `|query ∩ F(id)|`.
+    pub fn bound(&self, id: MethodId) -> u64 {
+        let ix = self.index;
+        self.ranges
+            .iter()
+            .map(|(r, qc)| match ix.postings[r.clone()].binary_search(&id.0) {
+                Ok(p) => {
+                    let c = ix.counts[r.start + p];
+                    u64::from(if c == COUNT_SAT { *qc } else { (*qc).min(u32::from(c)) })
+                }
+                Err(_) => 0,
+            })
+            .sum()
+    }
 }
 
 /// Feature bag of one method, as `(feature, count)` sorted by feature.
@@ -85,14 +119,24 @@ impl InvertedIndex {
         // Merge duplicate method IDs so postings stay strictly increasing.
         bags.par_sort_by_key(|(id, _)| *id);
         let mut merged: Vec<(MethodId, Bag)> = Vec::with_capacity(bags.len());
+        let mut sizes = vec![0u32; num_methods as usize];
+        let mut last_merged = None;
         for (id, bag) in bags {
             match merged.last_mut() {
                 Some((last, acc)) if *last == id => {
                     acc.extend(bag);
                     acc.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
                     acc.dedup_by_key(|e| e.0);
+                    last_merged = Some(id);
                 }
-                _ => merged.push((id, bag)),
+                _ => {
+                    let total: u64 = bag.iter().map(|e| u64::from(e.1)).sum();
+                    sizes[id.0 as usize] = u32::try_from(total).unwrap_or(u32::MAX);
+                    merged.push((id, bag));
+                }
+            }
+            if last_merged == Some(id) {
+                sizes[id.0 as usize] = 0; // several bags: no exact size, keep a lower bound
             }
         }
 
@@ -143,7 +187,19 @@ impl InvertedIndex {
             }
         }
 
-        Self { feature_ids, offsets, postings, counts, num_methods }
+        Self { feature_ids, offsets, postings, counts, sizes, num_methods }
+    }
+
+    /// `|F(m)|` as stored at build time (a lower bound, see `sizes`); 0 when
+    /// `id` is out of range.
+    pub fn size_of(&self, id: MethodId) -> u64 {
+        self.sizes.get(id.0 as usize).map_or(0, |&s| u64::from(s))
+    }
+
+    /// Resolves `query`'s posting ranges once, for [`ResolvedQuery::bound`].
+    pub fn resolve(&self, query: &FeatureBag) -> ResolvedQuery<'_> {
+        let ranges = query.entries().iter().filter_map(|&(f, qc)| Some((self.range_of(f)?, qc))).collect();
+        ResolvedQuery { index: self, ranges }
     }
 
     /// Top-`eta1` methods by overlap score `|S(F(m)) ∩ S(query)|`, sorted by
@@ -194,7 +250,9 @@ impl InvertedIndex {
             hits.truncate(eta1);
         }
         hits.sort_unstable_by(cmp);
-        hits.into_iter().map(|(m, c)| Hit { id: MethodId(m), overlap: c, bound: bound[m as usize] }).collect()
+        hits.into_iter()
+            .map(|(m, c)| Hit { id: MethodId(m), overlap: c, bound: bound[m as usize], size: u64::from(self.sizes[m as usize]) })
+            .collect()
     }
 
     /// Checks every invariant [`search_bounded`](Self::search_bounded) relies on,
@@ -223,6 +281,12 @@ impl InvertedIndex {
             self.postings.len()
         );
         ensure!(self.feature_ids.windows(2).all(|w| w[0] < w[1]), "feature ids are not strictly increasing");
+        ensure!(
+            self.sizes.len() == self.num_methods as usize,
+            "{} sizes for {} methods",
+            self.sizes.len(),
+            self.num_methods
+        );
         if let Some(&bad) = self.postings.iter().find(|&&m| m >= self.num_methods) {
             anyhow::bail!("posting {bad} is out of range (num_methods = {})", self.num_methods);
         }
@@ -291,9 +355,32 @@ mod tests {
         let mut x = good.clone();
         x.feature_ids.swap(0, 1);
         assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        x.sizes.pop();
+        assert!(x.validate(3).is_err());
         let mut x = good;
         x.offsets[0] = 1;
         assert!(x.validate(3).is_err());
+    }
+
+    /// Stage 6: per-method sizes and resolved-query bounds.
+    #[test]
+    fn sizes_and_resolved_bounds() {
+        let s = sample();
+        assert_eq!((s.size_of(MethodId(0)), s.size_of(MethodId(1)), s.size_of(MethodId(2))), (4, 301, 2));
+        assert_eq!(s.size_of(MethodId(9)), 0);
+        let q = FeatureBag::from_weighted(vec![(1, 2), (2, 2), (5, 400), (7, 1)]);
+        let r = s.resolve(&q);
+        // min(2,1) + min(2,3); min(2,1) + saturated 255 -> 400; min(2,2).
+        assert_eq!((r.bound(MethodId(0)), r.bound(MethodId(1)), r.bound(MethodId(2))), (3, 401, 2));
+        let hits = s.search_bounded(&q, 3);
+        for h in hits {
+            assert_eq!(r.bound(h.id), h.bound);
+            assert_eq!(s.size_of(h.id), h.size);
+        }
+        // Several bags for one ID: size falls back to the 0 lower bound.
+        let m = InvertedIndex::from_bags(vec![(MethodId(0), vec![(1, 1)]), (MethodId(0), vec![(2, 1)])], 1);
+        assert_eq!(m.size_of(MethodId(0)), 0);
     }
 
     /// Stage 5: overlaps are `u32` (no `u16` cap) and `search_*_where` filters

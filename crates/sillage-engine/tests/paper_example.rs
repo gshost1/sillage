@@ -132,7 +132,7 @@ fn n2_for(params_fq: &sillage_core::FeatureBag) -> Vec<sillage_engine::Ranked> {
         (MethodId(11), 47, distractor_b()),
         (MethodId(12), 3, distractor_c()),
     ];
-    rerank(params_fq, cands, &TestFeaturizer)
+    rerank(params_fq, params_fq, cands, &TestFeaturizer)
 }
 
 #[test]

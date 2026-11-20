@@ -29,6 +29,13 @@ impl Engine {
         Ok(self.featurizer.featurize_query(&tree).total())
     }
 
+    /// `(F(q), F_full(q))`: the query-mode features the engine matches, and the
+    /// full featurization of the snippet (Phase II tie-breaks only).
+    pub fn query_feature_pair(&self, lang: Lang, snippet: &str) -> anyhow::Result<(FeatureBag, FeatureBag)> {
+        let tree = sillage_parse::parse_snippet(lang, snippet)?;
+        Ok((self.featurizer.featurize_query(&tree).total(), self.featurizer.featurize(&tree).total()))
+    }
+
     /// Whether method `id` may be retrieved for a `lang` query: its language is
     /// in the query's family ([`lang_compatible`]) and it is not in `exclude`.
     /// Applied to Phase I *before* the η1 cut, so in a mixed-language index
@@ -52,33 +59,36 @@ impl Engine {
 
     /// Phases I and II, keeping the exact top `k` of the reranked list
     /// (see [`rerank_top`]); returns `(ranked, candidates parsed)`.
-    fn ranked_top(&self, lang: Lang, fq: &FeatureBag, k: usize) -> (Vec<Ranked>, usize) {
+    fn ranked_top(&self, lang: Lang, fq: &FeatureBag, fq_full: &FeatureBag, k: usize) -> (Vec<Ranked>, usize) {
         let hits = self.index.search_bounded_where(fq, self.params.eta1, |id| self.admissible(lang, &[], id));
-        rerank_top(fq, hits, k, None, self.featurizer.as_ref(), |id| self.load_tree(id))
+        let full = self.index.resolve(fq_full);
+        // Pre-load tie-break bound: full_sim ≤ Σ_f min(F_full(q)_f, m_f).
+        rerank_top(fq, fq_full, hits, k, None, self.featurizer.as_ref(), |id| self.load_tree(id), |id| full.bound(id))
     }
 
     /// Structural code search: Phases I and II, truncated to `n`.
     pub fn search(&self, lang: Lang, snippet: &str, n: usize) -> anyhow::Result<Vec<Ranked>> {
-        let fq = self.query_features(lang, snippet)?;
-        Ok(self.search_features(lang, &fq, n))
+        let (fq, fq_full) = self.query_feature_pair(lang, snippet)?;
+        Ok(self.search_features(lang, &fq, &fq_full, n))
     }
 
-    /// [`search`](Self::search) for already computed query features `fq`.
-    pub fn search_features(&self, lang: Lang, fq: &FeatureBag, n: usize) -> Vec<Ranked> {
-        self.ranked_top(lang, fq, n).0
+    /// [`search`](Self::search) for already computed query features
+    /// ([`query_feature_pair`](Self::query_feature_pair)).
+    pub fn search_features(&self, lang: Lang, fq: &FeatureBag, fq_full: &FeatureBag, n: usize) -> Vec<Ranked> {
+        self.ranked_top(lang, fq, fq_full, n).0
     }
 
     /// Phases I and II over all η1 candidates, re-parsing every one of them
     /// (the unbounded reference for [`search`](Self::search)).
     pub fn search_exhaustive(&self, lang: Lang, snippet: &str, n: usize) -> anyhow::Result<Vec<Ranked>> {
-        let fq = self.query_features(lang, snippet)?;
+        let (fq, fq_full) = self.query_feature_pair(lang, snippet)?;
         let cands: Vec<(MethodId, u32, SimplifiedTree)> = self
             .index
             .search_where(&fq, self.params.eta1, |id| self.admissible(lang, &[], id))
             .into_par_iter()
             .filter_map(|(id, overlap)| Some((id, overlap, self.load_tree(id)?)))
             .collect();
-        let mut ranked = rerank(&fq, cands, self.featurizer.as_ref());
+        let mut ranked = rerank(&fq, &fq_full, cands, self.featurizer.as_ref());
         ranked.truncate(n);
         Ok(ranked)
     }
@@ -116,7 +126,7 @@ impl Engine {
         let start = Instant::now();
 
         let t = Instant::now();
-        let fq = self.query_features(lang, snippet)?;
+        let (fq, fq_full) = self.query_feature_pair(lang, snippet)?;
         let parse_ms = ms(t);
 
         // Only the top η2 of N2 above τ1 reach Phase III (`cluster` takes the
@@ -127,9 +137,17 @@ impl Engine {
         let phase1_ms = ms(t);
 
         let t = Instant::now();
-        let (n2, parsed) = rerank_top(&fq, hits, self.params.eta2, Some(self.params.tau1), featurizer, |id| {
-            self.load_tree(id)
-        });
+        let full = self.index.resolve(&fq_full);
+        let (n2, parsed) = rerank_top(
+            &fq,
+            &fq_full,
+            hits,
+            self.params.eta2,
+            Some(self.params.tau1),
+            featurizer,
+            |id| self.load_tree(id),
+            |id| full.bound(id),
+        );
         let phase2_ms = ms(t);
 
         let t = Instant::now();

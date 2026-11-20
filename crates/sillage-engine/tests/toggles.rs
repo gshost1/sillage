@@ -13,7 +13,7 @@ fn rerank_flat(q: &[&'static str], trees: &[&[&'static str]]) -> (sillage_core::
         .enumerate()
         .map(|(i, toks)| (MethodId(i as u32), 100 - i as u32, flat(toks)))
         .collect();
-    let n2 = rerank(&fq, cands, &fz);
+    let n2 = rerank(&fq, &fq, cands, &fz);
     (fq, n2)
 }
 
@@ -164,12 +164,12 @@ fn rerank_sort_and_empty_query() {
         (MethodId(2), 1, flat(&["a", "b", "c"])),
         (MethodId(0), 5, flat(&["a", "y"])),
     ];
-    let n2 = rerank(&q, cands.clone(), &fz);
+    let n2 = rerank(&q, &q, cands.clone(), &fz);
     assert_eq!(n2.iter().map(|r| r.id.0).collect::<Vec<_>>(), [1, 2, 0, 3]);
     assert_eq!(n2[0].score, 1.0);
     assert_eq!(n2[2].score, 0.5);
 
-    let empty = rerank(&sillage_core::FeatureBag::new(), cands, &fz);
+    let empty = rerank(&sillage_core::FeatureBag::new(), &sillage_core::FeatureBag::new(), cands, &fz);
     assert!(empty.iter().all(|r| r.score == 0.0 && r.sim == 0));
 }
 

@@ -587,7 +587,7 @@ fn single_pass_index_and_bounded_rerank_are_exact() {
             for n in [1, 2, 3, 100] {
                 let a = engine.search(langs[0], q, n).unwrap();
                 let b = engine.search_exhaustive(langs[0], q, n).unwrap();
-                let key = |r: &sillage_engine::Ranked| (r.id, r.sim, r.overlap, r.pruned.keep.clone());
+                let key = |r: &sillage_engine::Ranked| (r.id, r.sim, r.overlap, r.full_sim, r.size, r.pruned.keep.clone());
                 assert_eq!(a.iter().map(key).collect::<Vec<_>>(), b.iter().map(key).collect::<Vec<_>>(), "{langs:?} n={n} {q:?}");
             }
         }
@@ -694,4 +694,45 @@ fn recommend_excluding_drops_methods_before_phase_two() {
     let narrow = engine.recommend_excluding(Lang::Java, LISTING4, &[top]).unwrap();
     assert!(narrow.n2.iter().all(|r| r.id != top));
     assert_eq!(engine.recommend_excluding(Lang::Java, LISTING4, &[]).unwrap().n2.len(), engine.recommend(Lang::Java, LISTING4).unwrap().n2.len());
+}
+
+/// Stage 6: methods tied on the pruned similarity are ordered by the full
+/// query featurization (`full_sim`), then by size, and the order is invariant
+/// under renaming the query's locals.
+#[test]
+fn sim_ties_break_structurally_and_alpha_invariantly() {
+    let dir = scratch("ties");
+    let corpus = dir.path().join("corpus");
+    // Ids follow the walk order (a, b, c), so the expected order is not the id order.
+    write(
+        &corpus,
+        "ra/src/A.java",
+        "class A {\n  int split(int[] xs) {\n    int total = 0;\n    log(xs.length);\n    for (int x : xs) {\n      total += x;\n    }\n    return total;\n  }\n}\n",
+    );
+    write(
+        &corpus,
+        "rb/src/B.java",
+        "class B {\n  int big(int[] xs) {\n    check(xs);\n    trace(\"big\");\n    audit(xs, 1);\n    int total = 0;\n    for (int x : xs) {\n      total += x;\n    }\n    return total;\n  }\n}\n",
+    );
+    write(
+        &corpus,
+        "rc/src/C.java",
+        "class C {\n  int tight(int[] ys) {\n    int sum = 0;\n    for (int y : ys) {\n      sum += y;\n    }\n    return sum;\n  }\n}\n",
+    );
+    let engine = engine_for(&corpus, &[Lang::Java], &dir.path().join("t.sil"));
+    let name = |r: &sillage_engine::Ranked| method_name(&engine, r.id);
+    let q = "int total = 0;\nfor (int x : xs) {\n  total += x;\n}\nreturn total;";
+    let renamed = "int acc = 0;\nfor (int e : arr) {\n  acc += e;\n}\nreturn acc;";
+    let key = |r: &sillage_engine::Ranked| (r.id, r.sim, r.overlap, r.full_sim, r.size);
+    let a = engine.search(Lang::Java, q, 10).unwrap();
+    assert_eq!(a.iter().map(name).collect::<Vec<_>>(), ["tight", "big", "split"], "{:?}", a.iter().map(key).collect::<Vec<_>>());
+    assert!(a.iter().all(|r| r.sim == a[0].sim && r.overlap == a[0].overlap), "all three contain the query");
+    assert!(a[0].full_sim == a[1].full_sim && a[1].full_sim > a[2].full_sim);
+    assert!(a[0].size < a[1].size);
+    let b = engine.search(Lang::Java, renamed, 10).unwrap();
+    assert_eq!(a.iter().map(key).collect::<Vec<_>>(), b.iter().map(key).collect::<Vec<_>>());
+    for n in [1, 2, 3] {
+        let ex = engine.search_exhaustive(Lang::Java, q, n).unwrap();
+        assert_eq!(a[..n].iter().map(key).collect::<Vec<_>>(), ex.iter().map(key).collect::<Vec<_>>());
+    }
 }

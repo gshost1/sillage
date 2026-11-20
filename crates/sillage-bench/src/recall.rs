@@ -118,9 +118,9 @@ pub fn evaluate_query(engine: &Engine, q: &RecallQuery) -> [Hits; 3] {
     let bm25 = score(&engine.bm25_search(q.lang, &q.snippet, DEPTH));
     let feats = engine.features_only(q.lang, &q.snippet, DEPTH).map(|ids| score(&ids)).unwrap_or_default();
     let sillage = engine
-        .query_features(q.lang, &q.snippet)
-        .map(|fq| {
-            let rs = engine.search_features(q.lang, &fq, DEPTH);
+        .query_feature_pair(q.lang, &q.snippet)
+        .map(|(fq, fq_full)| {
+            let rs = engine.search_features(q.lang, &fq, &fq_full, DEPTH);
             let pairs: Vec<(MethodId, u64)> = rs.iter().map(|r| (r.id, r.sim)).collect();
             let ids: Vec<MethodId> = pairs.iter().map(|p| p.0).collect();
             let mut h = score(&ids);
