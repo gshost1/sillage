@@ -167,3 +167,36 @@ fn rerank_sort_and_empty_query() {
     let empty = rerank(&sillage_core::FeatureBag::new(), cands, &fz);
     assert!(empty.iter().all(|r| r.score == 0.0 && r.sim == 0));
 }
+
+/// Stage 3: a whole regrouped call dropped after `.` (too big to restore) gets
+/// its callee back, so the kept receiver never renders as a dangling `view.`.
+#[test]
+fn complete_calls_restores_member_head_after_dot() {
+    use sillage_core::{Lang, NodeKind};
+    let text = "void f(View view) {\n  view.setOnTouchListener(new OnTouchListener() {\n    public boolean onTouch(View v, MotionEvent e) {\n      hide(v);\n      return false;\n    }\n  });\n}";
+    let body = sillage_core::Span::new(text.find('{').unwrap() as u32, text.len() as u32);
+    let base = sillage_parse::parse_method(Lang::Java, text, body).unwrap();
+    let toks: Vec<&str> = base
+        .leaves
+        .iter()
+        .map(|&l| match &base.node(l).kind {
+            NodeKind::Token { text, .. } => &**text,
+            _ => "",
+        })
+        .collect();
+    let keep: Vec<bool> = toks.iter().map(|&t| t == "view").collect();
+    let rec = base.retain(&keep);
+    let done = sillage_engine::complete_calls(&rec, &base);
+    let kept: Vec<&str> = done
+        .leaves
+        .iter()
+        .map(|&l| match &done.node(l).kind {
+            NodeKind::Token { text, .. } => &**text,
+            _ => "",
+        })
+        .collect();
+    assert_eq!(kept, ["view", "setOnTouchListener"], "only the head of the dropped call");
+    // A small hole is still restored whole, and nothing is added when nothing is missing.
+    let full = sillage_engine::complete_calls(&base, &base);
+    assert_eq!(full, base);
+}

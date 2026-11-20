@@ -22,6 +22,10 @@ pub struct Line {
     pub placeholder: bool,
     /// 1-based line in `tree.source` the line was copied from (`None` for placeholders).
     pub src_line: Option<usize>,
+    /// 1-based line in the method's *file*, once [`Layout::locate`] knows where the
+    /// method starts (`None` for placeholders and before `locate`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_line: Option<usize>,
 }
 
 /// Line-diff summary of the query against the rendered recommendation.
@@ -61,6 +65,37 @@ impl Layout {
     /// Number of extra (recommended) code lines, excluding placeholders.
     pub fn extra_code_lines(&self) -> usize {
         self.lines.iter().filter(|l| l.extra && !l.placeholder).count()
+    }
+
+    /// Sets each line's [`Line::file_line`], given the 1-based file line on which
+    /// `tree.source` (the method text) starts, e.g. `MethodRecord::line_start`.
+    pub fn locate(&mut self, source_first_line: usize) {
+        for l in &mut self.lines {
+            l.file_line = l.src_line.map(|s| s + source_first_line.max(1) - 1);
+        }
+    }
+
+    /// Keeps the first `max_lines` lines (at least one) and, when lines were cut,
+    /// appends a placeholder line `// ... (N more lines)` (`... (N more lines)`
+    /// for Python), indented like the last kept line.
+    pub fn truncate(&mut self, max_lines: usize) {
+        let max_lines = max_lines.max(1);
+        if self.lines.len() <= max_lines {
+            return;
+        }
+        let cut = self.lines.len() - max_lines;
+        self.lines.truncate(max_lines);
+        let indent = self.lines.last().map(|l| leading_ws(&l.text).to_string()).unwrap_or_default();
+        let placeholder = self.lang.parse::<sillage_core::Lang>().map_or("// ...", |l| l.placeholder());
+        let noun = if cut == 1 { "line" } else { "lines" };
+        self.lines.push(Line {
+            line_no: max_lines + 1,
+            text: format!("{indent}{placeholder} ({cut} more {noun})"),
+            extra: true,
+            placeholder: true,
+            src_line: None,
+            file_line: None,
+        });
     }
 }
 
@@ -346,6 +381,7 @@ pub fn layout(tree: &SimplifiedTree, query_match: &[bool], query: Option<&str>) 
                 || (l.matched_tokens == 0 && l.extra_kws > l.plain_kws),
             placeholder: l.placeholder,
             src_line: if l.placeholder { None } else { l.src_line },
+            file_line: None,
             text: l.text,
         })
         .collect();

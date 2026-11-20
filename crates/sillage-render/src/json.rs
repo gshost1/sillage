@@ -21,6 +21,9 @@ struct JsonLine<'a> {
     placeholder: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     src_line: Option<usize>,
+    /// Line in the method's file (set by `Layout::locate`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_line: Option<usize>,
 }
 
 impl<'a> From<&'a Line> for JsonLine<'a> {
@@ -31,6 +34,7 @@ impl<'a> From<&'a Line> for JsonLine<'a> {
             extra: l.extra,
             placeholder: l.placeholder,
             src_line: l.src_line,
+            file_line: l.file_line,
         }
     }
 }

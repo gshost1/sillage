@@ -389,3 +389,38 @@ fn style_from_str() {
     assert_eq!("json".parse::<Style>().unwrap(), Style::Json);
     assert!("pdf".parse::<Style>().is_err());
 }
+
+/// Stage 3: `Layout::locate` maps source lines to file lines; `truncate` cuts to
+/// N lines with a per-language `(K more lines)` placeholder, in every style.
+#[test]
+fn locate_and_truncate() {
+    let full = build(Lang::Java, JAVA);
+    let qm = vec![true; full.leaves.len()];
+    let mut lay = layout(&full, &qm, None);
+    let n = lay.lines.len();
+    assert!(n > 4);
+    lay.locate(40);
+    for l in &lay.lines {
+        assert_eq!(l.file_line, l.src_line.map(|s| s + 39));
+    }
+    lay.truncate(3);
+    assert_eq!(lay.lines.len(), 4);
+    let last = lay.lines.last().unwrap();
+    assert!(last.placeholder && last.extra && last.file_line.is_none());
+    assert!(last.text.trim_start().starts_with(&format!("// ... ({} more lines)", n - 3)), "{}", last.text);
+    let plain = crate::render_layout(&lay, Style::Plain);
+    assert_eq!(plain.lines().count(), 4, "{plain}");
+    let v: serde_json::Value = serde_json::from_str(&crate::render_layout(&lay, Style::Json)).unwrap();
+    assert_eq!(v["lines"][0]["file_line"], lay.lines[0].file_line.unwrap());
+    // No-op when short enough; one cut line reads "1 more line".
+    let mut short = layout(&full, &qm, None);
+    short.truncate(n);
+    assert_eq!(short.lines.len(), n);
+    short.truncate(n - 1);
+    assert!(short.lines.last().unwrap().text.ends_with("(1 more line)"));
+    // Python uses `...`.
+    let py = build(Lang::Python, "def f(a):\n    x = a\n    y = x\n    return y\n");
+    let mut pl = layout(&py, &vec![true; py.leaves.len()], None);
+    pl.truncate(1);
+    assert!(pl.lines.last().unwrap().text.trim_start().starts_with("... ("), "{:?}", pl.lines);
+}

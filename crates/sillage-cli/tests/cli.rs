@@ -100,6 +100,20 @@ fn cli_end_to_end() {
     assert!(!recs.is_empty());
     assert_eq!(recs[0]["cluster"].as_array().unwrap().len(), 2);
     assert!(recs[0]["render"]["code"].as_str().unwrap().contains("return false;"));
+    // Stage 3: cluster members carry metadata, lines carry file line numbers.
+    let m0 = &recs[0]["cluster"][0];
+    assert!(m0["repo"].is_string() && m0["path"].is_string() && m0["name"].is_string(), "{m0}");
+    let start = m0["line_start"].as_u64().unwrap();
+    let line0 = &recs[0]["render"]["lines"][0];
+    assert_eq!(line0["file_line"].as_u64().unwrap(), line0["src_line"].as_u64().unwrap() + start - 1, "{line0}");
+    // --max-lines truncates with a trailing placeholder.
+    let json = ok(&["query", "--index", i, qs, "--format", "json", "--max-lines", "2"], None);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let lines = v["recommendations"][0]["render"]["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[2]["text"].as_str().unwrap().contains("more line"), "{lines:?}");
+    let plain = ok(&["query", "--index", i, qs, "--format", "plain", "--max-lines", "2", "--k", "1"], None);
+    assert!(plain.contains("// ... ("), "{plain}");
     assert!(v["timings"]["total_ms"].as_f64().unwrap() >= 0.0);
     // stdin query with tuning flags
     let out = ok(&["query", "--index", i, "--lang", "java", "--format", "plain", "--tau1", "0.99", "-"], Some(LISTING4));

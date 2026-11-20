@@ -39,7 +39,12 @@ pub fn render(
     query: Option<&str>,
     style: Style,
 ) -> String {
-    let lay = layout(tree, query_match, query);
+    render_layout(&layout(tree, query_match, query), style)
+}
+
+/// Renders an already computed (e.g. [`Layout::locate`]d or
+/// [`Layout::truncate`]d) layout.
+pub fn render_layout(lay: &Layout, style: Style) -> String {
     match style {
         Style::Plain => {
             let mut code = lay.code();
@@ -48,9 +53,9 @@ pub fn render(
             }
             code
         }
-        Style::Ansi => ansi::render(&lay),
-        Style::Html => html::render(&lay),
-        Style::Json => json::render(&lay),
+        Style::Ansi => ansi::render(lay),
+        Style::Html => html::render(lay),
+        Style::Json => json::render(lay),
     }
 }
 

@@ -8,6 +8,11 @@
 //! [`MAX_HOLE_TOKENS`] tokens) of a kept node that sits next to one of the node's
 //! keywords: a callee before `(`, a receiver or member around `.`, the type after
 //! `instanceof` / `new` / in a cast, so the rendering has no syntactic holes.
+//!
+//! A larger dropped member after `.` / `?.` / `::` (a whole regrouped call such
+//! as `setOnTouchListener(new OnTouchListener() { … })`) gets only its head token
+//! back (`setOnTouchListener`), so the receiver never dangles as `view.`; the
+//! dropped arguments render as a placeholder.
 
 use rustc_hash::FxHashSet;
 use sillage_core::{NodeKind, SimplifiedTree, Span};
@@ -57,6 +62,9 @@ pub fn complete_calls(rec: &SimplifiedTree, base: &SimplifiedTree) -> Simplified
             };
             let next_kw = n.children.get(k + 1).is_some_and(|&x| anchor(x));
             let prev_kw = k > 0 && anchor(n.children[k - 1]);
+            let after_member = k > 0
+                && matches!(&base.node(n.children[k - 1]).kind,
+                    NodeKind::Keyword { text } if matches!(&**text, "." | "?." | "::"));
             if !(next_kw || prev_kw) {
                 continue;
             }
@@ -70,8 +78,16 @@ pub fn complete_calls(rec: &SimplifiedTree, base: &SimplifiedTree) -> Simplified
                 }
                 stack.extend(xn.children.iter().copied());
             }
-            if leaves.is_empty() || leaves.len() > MAX_HOLE_TOKENS {
+            if leaves.is_empty() {
                 continue;
+            }
+            if leaves.len() > MAX_HOLE_TOKENS {
+                if !after_member {
+                    continue;
+                }
+                // Restore the member's head (its first token in source order).
+                let head = *leaves.iter().min().expect("non-empty");
+                leaves = vec![head];
             }
             for li in leaves {
                 keep[li] = true;

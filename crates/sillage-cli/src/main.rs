@@ -52,6 +52,10 @@ pub enum Command {
         input: SnippetInput,
         #[arg(long, value_enum, default_value_t = Format::Ansi)]
         format: Format,
+        /// Truncate each recommendation to N lines, ending with
+        /// `// ... (K more lines)` (useful for long full-body singletons).
+        #[arg(long, value_name = "N")]
+        max_lines: Option<usize>,
         #[command(flatten)]
         params: ParamArgs,
     },
@@ -315,29 +319,54 @@ fn cmd_index(corpus_dir: &Path, out: &Path, langs: &[Lang]) -> anyhow::Result<()
     Ok(())
 }
 
-fn cmd_query(index: &Path, input: &SnippetInput, format: Format, params: &ParamArgs) -> anyhow::Result<()> {
+fn cmd_query(
+    index: &Path,
+    input: &SnippetInput,
+    format: Format,
+    max_lines: Option<usize>,
+    params: &ParamArgs,
+) -> anyhow::Result<()> {
     let (lang, snippet) = input.read()?;
     let engine = load_engine(index, params.to_params())?;
     let out = engine.recommend(lang, &snippet)?;
     let lookup = method_lookup(&engine);
     let style = Style::from(format);
+    // A recommendation's tree is (derived from) its first cluster member's method
+    // text, so that member's `line_start` maps rendered lines to file lines.
+    let layout_of = |r: &sillage_engine::Recommendation| {
+        let mut lay = sillage_render::layout(&r.tree, &r.query_match, Some(&snippet));
+        if let Some(m) = r.cluster.first().and_then(|id| lookup.get(id)) {
+            lay.locate(m.line_start as usize);
+        }
+        if let Some(n) = max_lines {
+            lay.truncate(n);
+        }
+        lay
+    };
     if format == Format::Json {
         let recs: Vec<serde_json::Value> = out
             .recommendations
             .iter()
             .map(|r| {
-                let rendered: serde_json::Value = serde_json::from_str(&sillage_render::render(
-                    &r.tree,
-                    &r.query_match,
-                    Some(&snippet),
-                    style,
-                ))
-                .unwrap_or(serde_json::Value::Null);
+                let members: Vec<serde_json::Value> = r
+                    .cluster
+                    .iter()
+                    .map(|id| match lookup.get(id) {
+                        Some(m) => serde_json::json!({
+                            "id": id.0,
+                            "repo": &*m.repo,
+                            "path": &*m.path,
+                            "name": &*m.name,
+                            "line_start": m.line_start,
+                        }),
+                        None => serde_json::json!({ "id": id.0 }),
+                    })
+                    .collect();
                 serde_json::json!({
-                    "cluster": r.cluster.iter().map(|id| describe(lookup.get(id), *id)).collect::<Vec<_>>(),
+                    "cluster": members,
                     "l": r.l,
                     "s": r.s,
-                    "render": rendered,
+                    "render": sillage_render::json::to_value(&layout_of(r)),
                 })
             })
             .collect();
@@ -360,7 +389,7 @@ fn cmd_query(index: &Path, input: &SnippetInput, format: Format, params: &ParamA
         for c in &cluster {
             println!("   from {c}");
         }
-        print!("{}", sillage_render::render(&r.tree, &r.query_match, Some(&snippet), style));
+        print!("{}", sillage_render::render_layout(&layout_of(r), style));
         println!();
     }
     let t = &out.timings;
@@ -464,7 +493,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Fetch { manifest, out } => cmd_fetch(&manifest, &out),
         Command::Index { corpus, out, langs } => cmd_index(&corpus, &out, &langs),
-        Command::Query { index, input, format, params } => cmd_query(&index, &input, format, &params),
+        Command::Query { index, input, format, max_lines, params } => {
+            cmd_query(&index, &input, format, max_lines, &params)
+        }
         Command::Search { index, input, n, show, format, params } => {
             cmd_search(&index, &input, n, show, format, &params)
         }
@@ -549,9 +580,10 @@ mod tests {
     fn parses_query_with_params() {
         match parse(&[
             "query", "--index", "i.bin", "--lang", "java", "q.java", "--format", "json", "--k", "3", "--eta1",
-            "500", "--eta2", "50", "--tau1", "0.5", "--tau2", "2.0", "--tau3", "0.8",
+            "500", "--eta2", "50", "--tau1", "0.5", "--tau2", "2.0", "--tau3", "0.8", "--max-lines", "12",
         ]) {
-            Command::Query { index, input, format, params } => {
+            Command::Query { index, input, format, max_lines, params } => {
+                assert_eq!(max_lines, Some(12));
                 assert_eq!(index, PathBuf::from("i.bin"));
                 assert_eq!(input.lang, Some(Lang::Java));
                 assert_eq!(input.file, Some(PathBuf::from("q.java")));
@@ -564,7 +596,8 @@ mod tests {
             c => panic!("{c:?}"),
         }
         match parse(&["query", "--index", "i.bin", "--lang", "python"]) {
-            Command::Query { input, format, params, .. } => {
+            Command::Query { input, format, params, max_lines, .. } => {
+                assert_eq!(max_lines, None);
                 assert!(input.file.is_none() && input.is_stdin());
                 assert_eq!(format, Format::Ansi);
                 assert_eq!(params.to_params(), Params::default());
