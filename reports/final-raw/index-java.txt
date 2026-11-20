@@ -1,0 +1,1 @@
+indexed 80192 methods, 883117 features, 5288669 postings in 6.8s -> data/java.sil

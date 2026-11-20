@@ -1,0 +1,1 @@
+indexed 8554 methods, 174168 features, 633839 postings in 0.8s -> data/python.sil

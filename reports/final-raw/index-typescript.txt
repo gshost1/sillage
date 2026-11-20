@@ -1,0 +1,2 @@
+warning: 17 source files could not be read or are not valid UTF-8
+indexed 5592 methods, 94430 features, 392512 postings in 1.0s -> data/typescript.sil

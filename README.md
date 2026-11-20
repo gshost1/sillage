@@ -71,13 +71,15 @@ Query fixtures for every language are in `bench/queries/`, for example `viewgrou
 | `--tau2` [1.5] | minimum cluster extension ratio `l(τ)`, finite ≥ 0 |
 | `--tau3` [0.9] | minimum cluster query alignment `s(τ)`, in [0, 1] |
 
-## Results (Stage 5, n = 1000, bootstrap 1000)
+## Results (Stage 6, n = 1000, bootstrap 1000)
 
-Strict R@1 means the original method is ranked first; this is the like-for-like column. §5 R@1 adds the paper's "100% similar" clause:
+Strict R@1 means the original method is ranked first; this is the like-for-like column. Sillage orders equal-similarity candidates structurally: first by overlap with the query's full featurization, then by method size, both computed on alpha-renamed features (DESIGN Decision 24). BM25 and feature search break ties by method id.
+
+§5 R@1 adds the paper's "100% similar" clause:
 - for every system, a rank-1 method with exactly the original's features;
 - for Sillage only, a tie with rank 1 at the full query similarity |F(q)|.
 
-Seed 7 is the development seed; seed 2027 is held out. Details and CIs: [reports/final-benchmarks.md](reports/final-benchmarks.md).
+Seed 7 is the development seed, and the tie-break was chosen on it. Seed 2027 is held out. Details, CIs and the Stage 5 → Stage 6 comparison: [reports/final-benchmarks.md](reports/final-benchmarks.md).
 
 **Java, paper Table 4** (80,192 methods):
 
@@ -85,31 +87,31 @@ Seed 7 is the development seed; seed 2027 is held out. Details and CIs: [reports
 |---|---|---|---|---|---|
 | BM25 | contiguous | 75.8% / 73.1% | 75.9% / 73.3% | 99.6% / 99.5% | 78.3% / 96.9% |
 | Features | contiguous | 81.7% / 80.5% | 82.2% / 80.6% | 99.9% / 99.7% | 78.3% / 96.8% |
-| **Sillage** | contiguous | **82.4% / 81.3%** | **92.9% / 91.5%** | **100.0% / 99.7%** | 99.1% / 100% |
+| **Sillage** | contiguous | **85.8% / 84.7%** | **94.0% / 93.4%** | **100.0% / 99.7%** | 99.1% / 100% |
 | BM25 | non-contiguous | 82.9% / 82.6% | 83.0% / 82.6% | 99.9% / 99.8% | 93.0% / 99.9% |
 | Features | non-contiguous | 79.2% / 82.6% | 79.7% / 82.6% | 99.3% / 98.6% | 88.1% / 98.6% |
-| **Sillage** | non-contiguous | **79.8% / 83.2%** | **84.5% / 86.6%** | **99.3% / 98.6%** | 98.3% / 100% |
+| **Sillage** | non-contiguous | **84.2% / 84.3%** | **86.9% / 87.3%** | **99.2% / 98.8%** | 98.3% / 100% |
 
-The paper's 99.1% / 98.3% are matched only under the pre-Stage 5 "any equal-similarity tie" rule (99.2% / 95.5% at seed 7). That rule credits partial ties, so it is no longer used.
+Stage 5 (ties broken by method id) had Sillage strict R@1 82.4% / 81.3% contiguous and 79.8% / 83.2% non-contiguous. The paper's 99.1% / 98.3% are matched only under the pre-Stage 5 "any equal-similarity tie" rule (99.2% / 95.5% at seed 7). That rule credits partial ties, so it is no longer used.
 
 **Multi-language Table 5** (seed 7, Sillage):
 
 | Language | Methods | Strict R@1 contig / non-contig | §5 R@1 contig / non-contig | R@100 contig / non-contig |
 |---|---|---|---|---|
-| Python | 8,554 | 77.4% / 83.5% | 78.9% / 84.3% | 96.7% / 95.5% |
-| JavaScript | 9,347 | 68.1% / 62.5% | 86.7% / 67.7% | 99.5% / 96.6% |
-| TypeScript | 5,592 | 73.5% / 70.4% | 89.1% / 71.6% | 100.0% / 98.7% |
-| Go | 3,729 | 86.3% / 84.4% | 91.5% / 85.4% | 100.0% / 98.4% |
-| Rust | 8,677 | 84.7% / 79.6% | 96.6% / 82.3% | 99.4% / 97.2% |
+| Python | 8,554 | 79.0% / 85.8% | 80.2% / 86.5% | 96.6% / 95.3% |
+| JavaScript | 9,347 | 91.1% / 79.4% | 94.7% / 80.6% | 99.4% / 97.1% |
+| TypeScript | 5,592 | 77.2% / 74.5% | 91.5% / 75.5% | 100.0% / 98.6% |
+| Go | 3,729 | 88.8% / 85.8% | 93.1% / 86.9% | 100.0% / 98.4% |
+| Rust | 8,677 | 87.6% / 80.3% | 97.0% / 82.7% | 99.4% / 97.4% |
 
 **Quality and latency (Java, n = 200):**
 - Seed 7: 73.0% of queries contained (≥ τ1), 2.65 recommendations per query, 16.5% with a multi-method cluster.
-- Seed 2027: 74.0%, 2.79 and 23.5%.
-- `recommend` latency: p50 3.4 ms, p95 23.3 ms.
+- Seed 2027: 74.0%, 2.79 and 24.5%.
+- `recommend` latency: p50 2.8–2.9 ms, p95 23–24 ms (Stage 5 binary in the same session: p50 2.7–2.8 ms, p95 20–21 ms).
 
 ## Documentation
 
-- [docs/DESIGN.md](docs/DESIGN.md): architecture, crate graph, how each paper ambiguity was resolved (Decisions 1–23), and index format v4 (xxh3 checksum, validation on load).
+- [docs/DESIGN.md](docs/DESIGN.md): architecture, crate graph, how each paper ambiguity was resolved (Decisions 1–24), and index format v5 (xxh3 checksum, per-method sizes, validation on load).
 - [reports/final-benchmarks.md](reports/final-benchmarks.md): Stage 5 benchmarks and the list of review fixes. Earlier stages are in `reports/`.
 
 ## License

@@ -1,0 +1,1 @@
+indexed 8677 methods, 118612 features, 558404 postings in 0.8s -> data/rust.sil
