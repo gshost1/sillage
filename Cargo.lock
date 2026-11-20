@@ -880,6 +880,7 @@ dependencies = [
  "sillage-index",
  "sillage-parse",
  "sillage-render",
+ "tempfile",
  "toml",
 ]
 

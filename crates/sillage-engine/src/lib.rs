@@ -1,5 +1,21 @@
+//! Sillage engine: Aroma's prune (Algorithm 1), rerank (Phase II), cluster and
+//! intersect (Phase III), and the end-to-end [`Engine`] pipeline.
+
+mod cluster;
+mod complete;
+mod intersect;
+mod pipeline;
+mod prune;
+mod rerank;
+
+pub use cluster::{ScoredCluster, cluster, cluster_scored};
+pub use complete::complete_calls;
+pub use intersect::intersect;
+pub use prune::prune;
+pub use rerank::rerank;
+
 use serde::{Deserialize, Serialize};
-use sillage_core::{FeatureBag, Featurizer, Lang, LeafFeatures, MethodId, Params, SimplifiedTree};
+use sillage_core::{Featurizer, MethodId, Params, SimplifiedTree};
 use sillage_index::{Bm25, Corpus, InvertedIndex};
 
 #[derive(Debug, Clone)]
@@ -7,10 +23,6 @@ pub struct Pruned {
     pub keep: Vec<bool>,
     pub sim: u64,
     pub tree: SimplifiedTree,
-}
-
-pub fn prune(_fq: &FeatureBag, _m: &SimplifiedTree, _lf: &LeafFeatures) -> Pruned {
-    todo!("Slice C")
 }
 
 #[derive(Debug, Clone)]
@@ -21,33 +33,6 @@ pub struct Ranked {
     pub score: f64,
     pub pruned: Pruned,
     pub tree: SimplifiedTree,
-}
-
-pub fn rerank(
-    _fq: &FeatureBag,
-    _cands: Vec<(MethodId, u32, SimplifiedTree)>,
-    _featurizer: &dyn Featurizer,
-) -> Vec<Ranked> {
-    todo!("Slice C")
-}
-
-pub fn cluster(
-    _fq: &FeatureBag,
-    _n2: &[Ranked],
-    _params: &Params,
-    _featurizer: &dyn Featurizer,
-) -> Vec<Vec<usize>> {
-    todo!("Slice C")
-}
-
-pub fn intersect(
-    _tuple: &[usize],
-    _fq: &FeatureBag,
-    _n2: &[Ranked],
-    _params: &Params,
-    _featurizer: &dyn Featurizer,
-) -> SimplifiedTree {
-    todo!("Slice C")
 }
 
 #[derive(Debug, Clone)]
@@ -98,26 +83,5 @@ impl Engine {
             featurizer,
             params,
         }
-    }
-
-    pub fn search(&self, _lang: Lang, _snippet: &str, _n: usize) -> anyhow::Result<Vec<Ranked>> {
-        todo!("Slice C")
-    }
-
-    pub fn features_only(
-        &self,
-        _lang: Lang,
-        _snippet: &str,
-        _n: usize,
-    ) -> anyhow::Result<Vec<MethodId>> {
-        todo!("Slice C")
-    }
-
-    pub fn bm25_search(&self, _snippet: &str, _n: usize) -> Vec<MethodId> {
-        todo!("Slice C")
-    }
-
-    pub fn recommend(&self, _lang: Lang, _snippet: &str) -> anyhow::Result<Output> {
-        todo!("Slice C")
     }
 }

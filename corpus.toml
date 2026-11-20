@@ -1,0 +1,111 @@
+# Sillage corpus manifest. `sillage fetch --manifest corpus.toml --out corpus/`
+# shallow-clones every repo and checks out the pinned `rev` (full commit SHA).
+# `tag` records the release the SHA was resolved from (2026-11-20, `git ls-remote`).
+
+# --- Java (paper §4/§5 language) ---------------------------------------------
+
+[[repo]]
+name = "jsoup"
+url = "https://github.com/jhy/jsoup"
+tag = "jsoup-1.18.1"
+rev = "19e8539fbfae80432fc4d8e9b562a39f786f547e"
+lang = "java"
+
+[[repo]]
+name = "junit4"
+url = "https://github.com/junit-team/junit4"
+tag = "r4.13.2"
+rev = "05fe2a64f59127c02135be22f416e91260d6ede6"
+lang = "java"
+
+[[repo]]
+name = "commons-io"
+url = "https://github.com/apache/commons-io"
+tag = "rel/commons-io-2.16.1"
+rev = "290d72eda9152d1e11b79d48453908ff3f6b9897"
+lang = "java"
+
+[[repo]]
+name = "commons-lang"
+url = "https://github.com/apache/commons-lang"
+tag = "rel/commons-lang-3.14.0"
+rev = "c8774fa74adbbbcd4e5f915ab6bc3aa10d877419"
+lang = "java"
+
+[[repo]]
+name = "retrofit"
+url = "https://github.com/square/retrofit"
+tag = "2.11.0"
+rev = "cc76c22a68e090f3dd898cbcb0bac30414f59c31"
+lang = "java"
+
+[[repo]]
+name = "guava"
+url = "https://github.com/google/guava"
+tag = "v33.3.1"
+rev = "df9602b6f1dd36414464229e0a441469d06e4575"
+lang = "java"
+
+# --- Python --------------------------------------------------------------------
+
+[[repo]]
+name = "requests"
+url = "https://github.com/psf/requests"
+tag = "v2.32.3"
+rev = "0e322af87745eff34caffe4df68456ebc20d9068"
+lang = "python"
+
+[[repo]]
+name = "click"
+url = "https://github.com/pallets/click"
+tag = "8.1.7"
+rev = "874ca2bc1c30d93a4ac6e36a15ed685eafe89097"
+lang = "python"
+
+# --- JavaScript / TypeScript -------------------------------------------------
+
+[[repo]]
+name = "express"
+url = "https://github.com/expressjs/express"
+tag = "4.21.1"
+rev = "8e229f92752ad51462c868b99f6e6c2e559801b0"
+lang = "javascript"
+
+[[repo]]
+name = "zod"
+url = "https://github.com/colinhacks/zod"
+tag = "v3.23.8"
+rev = "ca42965df46b2f7e2747db29c40a26bcb32a51d5"
+lang = "typescript"
+
+# --- Go --------------------------------------------------------------------------
+
+[[repo]]
+name = "cobra"
+url = "https://github.com/spf13/cobra"
+tag = "v1.8.1"
+rev = "e94f6d0dd9a5e5738dca6bce03c4b1207ffbc0ec"
+lang = "go"
+
+[[repo]]
+name = "mux"
+url = "https://github.com/gorilla/mux"
+tag = "v1.8.1"
+rev = "b4617d0b9670ad14039b2739167fd35a60f557c5"
+lang = "go"
+
+# --- Rust ------------------------------------------------------------------------
+
+[[repo]]
+name = "ripgrep"
+url = "https://github.com/BurntSushi/ripgrep"
+tag = "14.1.1"
+rev = "4649aa9700619f94cf9c66876e9549d83420e16c"
+lang = "rust"
+
+[[repo]]
+name = "serde_json"
+url = "https://github.com/serde-rs/json"
+tag = "v1.0.128"
+rev = "d96b1d9b643b49a0bb92a8cf280daf6aa08f37cc"
+lang = "rust"

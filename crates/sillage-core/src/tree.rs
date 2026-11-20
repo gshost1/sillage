@@ -175,6 +175,28 @@ impl SimplifiedTree {
             }
         }
 
+        // Keep token-less subtrees (e.g. `{}`, `[]`, `()` literals) of kept nodes
+        // whole: they behave like compound keywords and carry no features.
+        let mut has_token = vec![false; self.nodes.len()];
+        for id in (0..self.nodes.len()).rev() {
+            let n = &self.nodes[id];
+            has_token[id] = n.kind.is_token() || n.children.iter().any(|&c| has_token[c as usize]);
+        }
+        for id in 0..self.nodes.len() {
+            if marked[id] && self.nodes[id].kind.is_internal() {
+                for &child in &self.nodes[id].children {
+                    let c = child as usize;
+                    if self.nodes[c].kind.is_internal() && !has_token[c] {
+                        let mut stack = vec![child];
+                        while let Some(x) = stack.pop() {
+                            marked[x as usize] = true;
+                            stack.extend(self.nodes[x as usize].children.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+
         // Also mark Keyword children of every kept Internal node.
         for id in 0..self.nodes.len() {
             if marked[id] && self.nodes[id].kind.is_internal() {

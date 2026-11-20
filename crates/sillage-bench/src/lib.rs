@@ -1,5 +1,16 @@
+//! §5 recall (Table 4) and §4.2 quality benchmarks.
+
 use serde::{Deserialize, Serialize};
 use sillage_engine::Engine;
+
+pub mod bootstrap;
+pub mod quality;
+pub mod recall;
+pub mod report;
+pub mod sample;
+
+pub use bootstrap::bootstrap_ci;
+pub use report::{quality_json, quality_markdown, recall_json, recall_markdown};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecallMode {
@@ -52,12 +63,53 @@ pub struct QualityReport {
     pub avg_extra_lines: f64,
     pub p50_ms: f64,
     pub p95_ms: f64,
+    /// Slowest query end to end.
+    #[serde(default)]
+    pub max_ms: f64,
+    /// Per-phase latency percentiles (`parse`, `phase1`, `phase2`, `phase3`).
+    #[serde(default)]
+    pub phases: Vec<PhaseLatency>,
 }
 
-pub fn recall(_engine: &Engine, _cfg: RecallCfg) -> anyhow::Result<RecallReport> {
-    todo!("Slice D")
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseLatency {
+    pub phase: String,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub max_ms: f64,
 }
 
-pub fn quality(_engine: &Engine, _cfg: QualityCfg) -> anyhow::Result<QualityReport> {
-    todo!("Slice D")
+impl std::str::FromStr for RecallMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+            "contiguous" => Ok(RecallMode::Contiguous),
+            "noncontiguous" => Ok(RecallMode::NonContiguous),
+            other => Err(format!("unknown recall mode: {other}")),
+        }
+    }
+}
+
+/// Paper §5 / Table 4: Recall@1 and Recall@100 of BM25, feature search and Sillage.
+pub fn recall(engine: &Engine, cfg: RecallCfg) -> anyhow::Result<RecallReport> {
+    recall::run(engine, cfg)
+}
+
+/// Paper §4.2: recommendation quality on half-snippet queries.
+pub fn quality(engine: &Engine, cfg: QualityCfg) -> anyhow::Result<QualityReport> {
+    quality::run(engine, cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recall_mode_parses() {
+        assert_eq!("contiguous".parse::<RecallMode>().unwrap(), RecallMode::Contiguous);
+        assert_eq!("non-contiguous".parse::<RecallMode>().unwrap(), RecallMode::NonContiguous);
+        assert_eq!("noncontiguous".parse::<RecallMode>().unwrap(), RecallMode::NonContiguous);
+        assert!("random".parse::<RecallMode>().is_err());
+    }
 }

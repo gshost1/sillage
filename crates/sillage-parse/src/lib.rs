@@ -1,6 +1,19 @@
+//! Tree-sitter front end for sillage: simplified parse trees (Aroma §3.1),
+//! lexical scoping of local variables, method extraction and error-tolerant
+//! snippet parsing for Java, Python, JavaScript, TypeScript/TSX, Go and Rust.
+
+use std::cell::RefCell;
 use std::path::Path;
 
+use anyhow::{Context, Result};
 use sillage_core::{Lang, SimplifiedTree, Span};
+use tree_sitter::{Parser, Tree};
+
+mod extract;
+mod lang;
+mod lower;
+mod scope;
+mod snippet;
 
 #[derive(Debug, Clone)]
 pub struct ExtractedMethod {
@@ -11,18 +24,64 @@ pub struct ExtractedMethod {
     pub tree: SimplifiedTree,
 }
 
-pub fn lang_from_path(_p: &Path) -> Option<Lang> {
-    todo!("Slice A")
+/// The tree-sitter grammar used for `lang`.
+pub fn ts_language(lang: Lang) -> tree_sitter::Language {
+    lang::ts_language(lang)
 }
 
-pub fn extract_methods(_lang: Lang, _src: &str) -> Vec<ExtractedMethod> {
-    todo!("Slice A")
+pub fn lang_from_path(p: &Path) -> Option<Lang> {
+    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "java" => Lang::Java,
+        "py" | "pyi" => Lang::Python,
+        "js" | "jsx" | "mjs" | "cjs" => Lang::JavaScript,
+        "ts" | "mts" | "cts" => Lang::TypeScript,
+        "tsx" => Lang::Tsx,
+        "go" => Lang::Go,
+        "rs" => Lang::Rust,
+        _ => return None,
+    })
 }
 
-pub fn parse_method(_lang: Lang, _text: &str, _body: Span) -> anyhow::Result<SimplifiedTree> {
-    todo!("Slice A")
+/// Extracts every method/function with a body from `src`.
+///
+/// `text_span` indexes `src`; `body_span` is relative to `text_span.start`, and
+/// `tree` equals `parse_method(lang, &src[text_span], body_span)`.
+pub fn extract_methods(lang: Lang, src: &str) -> Vec<ExtractedMethod> {
+    extract::extract(lang, src)
 }
 
-pub fn parse_snippet(_lang: Lang, _snippet: &str) -> anyhow::Result<SimplifiedTree> {
-    todo!("Slice A")
+/// Parses a full method's text (as extracted) and returns the simplified tree of
+/// its body (`body` is relative to `text`); parameters still resolve as locals.
+/// `tree.source` is `text`, so spans index the full method text.
+pub fn parse_method(lang: Lang, text: &str, body: Span) -> Result<SimplifiedTree> {
+    snippet::parse_method(lang, text, body)
+}
+
+/// Parses a query snippet; spans index into `snippet`.
+pub fn parse_snippet(lang: Lang, snippet: &str) -> Result<SimplifiedTree> {
+    snippet::parse_snippet(lang, snippet)
+}
+
+thread_local! {
+    static PARSERS: RefCell<Vec<Option<Parser>>> =
+        RefCell::new((0..Lang::ALL.len()).map(|_| None).collect());
+}
+
+pub(crate) fn parse_ts(lang: Lang, text: &str) -> Result<Tree> {
+    PARSERS.with(|cell| {
+        let mut parsers = cell.borrow_mut();
+        let slot = &mut parsers[lang::lang_index(lang)];
+        if slot.is_none() {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&lang::ts_language(lang))
+                .with_context(|| format!("loading tree-sitter grammar for {lang}"))?;
+            *slot = Some(parser);
+        }
+        let parser = slot.as_mut().expect("parser initialised");
+        parser
+            .parse(text, None)
+            .with_context(|| format!("tree-sitter failed to parse {lang} source"))
+    })
 }
