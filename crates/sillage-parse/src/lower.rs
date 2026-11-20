@@ -26,11 +26,35 @@ use crate::scope::MAX_DEPTH;
 pub(crate) struct Mapping {
     /// `(wrapped_start, original_start, len)`, sorted and non-overlapping.
     segs: Vec<(u32, u32, u32)>,
+    /// Wrapped `[start, end)` of synthesized closers (`)`, `]`, `}`) appended to an
+    /// unbalanced snippet: their keywords are kept with a zero-width span.
+    phantom: Option<(u32, u32)>,
 }
 
 impl Mapping {
     pub(crate) fn new(segs: Vec<(u32, u32, u32)>) -> Self {
-        Self { segs }
+        Self { segs, phantom: None }
+    }
+
+    pub(crate) fn with_phantom(mut self, start: u32, end: u32) -> Self {
+        self.phantom = Some((start, end));
+        self
+    }
+
+    fn in_phantom(&self, ws: usize) -> bool {
+        self.phantom.is_some_and(|(s, e)| (s as usize..e as usize).contains(&ws))
+    }
+
+    /// Original offset for wrapped offset `ws`, clamped into the nearest segment.
+    fn clamp(&self, ws: usize) -> u32 {
+        let ws = ws as u32;
+        match self.segs.partition_point(|s| s.0 <= ws).checked_sub(1) {
+            Some(i) => {
+                let (w, o, len) = self.segs[i];
+                o + (ws - w).min(len)
+            }
+            None => self.segs.first().map_or(0, |s| s.1),
+        }
     }
 
     /// Maps a node's wrapped `[ws, we)` to the original text. The start must lie
@@ -74,8 +98,29 @@ impl Lowerer<'_> {
             .unwrap_or("")
     }
 
+    /// Zero-width keyword for a `MISSING` token or a synthesized closer, so an
+    /// unbalanced snippet still reads `{#}` / `#;` like the complete corpus code.
+    fn phantom(&self, node: Node<'_>) -> Option<Draft> {
+        // An anonymous node's kind is its literal token text.
+        let text = node.kind();
+        if node.is_named() || text.trim().is_empty() {
+            return None;
+        }
+        let at = self.map.clamp(node.start_byte());
+        Some(Draft {
+            kind: NodeKind::Keyword { text: text.into() },
+            span: Span::new(at, at),
+            children: Vec::new(),
+        })
+    }
+
     fn leaf(&self, node: Node<'_>, keyword: bool) -> Option<Draft> {
-        let span = self.map.map(node.start_byte(), node.end_byte())?;
+        let Some(span) = self.map.map(node.start_byte(), node.end_byte()) else {
+            if keyword && !node.is_named() && self.map.in_phantom(node.start_byte()) {
+                return self.phantom(node);
+            }
+            return None;
+        };
         if span.is_empty() {
             return None;
         }
@@ -99,7 +144,10 @@ impl Lowerer<'_> {
     }
 
     pub(crate) fn lower(&self, node: Node<'_>, depth: usize) -> Option<Draft> {
-        if node.is_missing() || node.start_byte() >= node.end_byte() {
+        if node.is_missing() {
+            return self.phantom(node);
+        }
+        if node.start_byte() >= node.end_byte() {
             return None;
         }
         let info = self.t.info(node);

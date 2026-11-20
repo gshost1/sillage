@@ -4,7 +4,8 @@ use rand::Rng;
 use rand::seq::index;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
-use sillage_core::MethodRecord;
+use rayon::prelude::*;
+use sillage_core::{MethodRecord, NodeKind};
 
 /// Paper §5: sampled method bodies have at least 12 lines of code.
 pub const MIN_BODY_LINES: usize = 12;
@@ -39,6 +40,58 @@ pub fn body_lines(body: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Lines of a method body that hold code (paper §5: "lines of code"): every line
+/// touched by a terminal of the parsed body, except the body's own outer `{`/`}`.
+/// Comment-only and blank lines are skipped. Lines are full source lines (with
+/// their indentation), clipped to the body span; falls back to [`body_lines`]
+/// when the method does not parse.
+pub fn code_lines(m: &MethodRecord) -> Vec<&str> {
+    let text: &str = &m.text;
+    let (bs, be) = (m.body.start as usize, m.body.end as usize);
+    if !(bs < be && be <= text.len()) {
+        return body_lines(body_text(m));
+    }
+    let tree = match sillage_parse::parse_method(m.lang, text, m.body) {
+        Ok(t) if !t.is_empty() => t,
+        _ => return body_lines(body_text(m)),
+    };
+    let mut starts = vec![0usize];
+    starts.extend(text.bytes().enumerate().filter(|&(_, b)| b == b'\n').map(|(i, _)| i + 1));
+    let line_of = |off: usize| match starts.binary_search(&off) {
+        Ok(i) => i,
+        Err(i) => i - 1,
+    };
+    let root = &tree.nodes[0];
+    let is_kw = |id: u32, s: &str| matches!(&tree.node(id).kind, NodeKind::Keyword { text } if &**text == s);
+    let mut skip = [u32::MAX; 2];
+    if root.kind.is_internal() && root.children.len() >= 2 {
+        let (f, l) = (root.children[0], *root.children.last().expect("children"));
+        if is_kw(f, "{") && is_kw(l, "}") {
+            skip = [f, l];
+        }
+    }
+    let mut code = vec![false; starts.len()];
+    for (id, n) in tree.nodes.iter().enumerate() {
+        if !n.children.is_empty() || n.span.is_empty() || skip.contains(&(id as u32)) {
+            continue;
+        }
+        for l in line_of(n.span.start as usize)..=line_of(n.span.end as usize - 1) {
+            code[l] = true;
+        }
+    }
+    (0..starts.len())
+        .filter(|&l| code[l])
+        .filter_map(|l| {
+            let ls = starts[l];
+            let le = starts.get(l + 1).map_or(text.len(), |&x| x - 1);
+            let s = if text[ls..bs.clamp(ls, le)].trim().is_empty() { ls } else { bs.clamp(ls, le) };
+            let e = le.min(be).max(s);
+            let line = text[s..e].trim_end_matches('\r');
+            (!line.trim().is_empty()).then_some(line)
+        })
+        .collect()
+}
+
 /// Joins `lines`, removing the longest common leading whitespace prefix.
 pub fn dedent(lines: &[&str]) -> String {
     let mut common: Option<&str> = None;
@@ -69,10 +122,11 @@ pub fn dedent(lines: &[&str]) -> String {
 /// Indices into `methods` of up to `n` methods with at least `min_lines`
 /// non-empty body lines, sampled without replacement with `ChaCha8Rng(seed)`.
 pub fn sample_methods(methods: &[MethodRecord], n: usize, min_lines: usize, seed: u64) -> Vec<usize> {
+    // Non-empty text lines bound code lines from above: cheap pre-filter first.
     let eligible: Vec<usize> = methods
-        .iter()
+        .par_iter()
         .enumerate()
-        .filter(|(_, m)| body_lines(body_text(m)).len() >= min_lines)
+        .filter(|(_, m)| body_lines(body_text(m)).len() >= min_lines && code_lines(m).len() >= min_lines)
         .map(|(i, _)| i)
         .collect();
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -85,14 +139,22 @@ pub fn sample_methods(methods: &[MethodRecord], n: usize, min_lines: usize, seed
 
 /// First `k` non-empty body lines (paper §5 contiguous queries).
 pub fn extract_contiguous_query(body_text: &str, k: usize) -> String {
-    let lines = body_lines(body_text);
+    contiguous_from_lines(&body_lines(body_text), k)
+}
+
+/// First `k` of `lines`, dedented.
+pub fn contiguous_from_lines(lines: &[&str], k: usize) -> String {
     dedent(&lines[..k.min(lines.len())])
 }
 
 /// `k` randomly sampled non-empty body lines, kept in original order
 /// (paper §5 non-contiguous queries).
 pub fn extract_noncontiguous_query<R: Rng + ?Sized>(body_text: &str, k: usize, rng: &mut R) -> String {
-    let lines = body_lines(body_text);
+    noncontiguous_from_lines(&body_lines(body_text), k, rng)
+}
+
+/// `k` random `lines` kept in order, dedented.
+pub fn noncontiguous_from_lines<R: Rng + ?Sized>(lines: &[&str], k: usize, rng: &mut R) -> String {
     let take = k.min(lines.len());
     let mut picks = index::sample(rng, lines.len(), take).into_vec();
     picks.sort_unstable();
@@ -104,7 +166,11 @@ pub fn extract_noncontiguous_query<R: Rng + ?Sized>(body_text: &str, k: usize, r
 /// first half is the query, the second half the held-out ground truth
 /// (paper §4.2). Odd counts put the extra line in the held-out half.
 pub fn split_half_query(body_text: &str) -> (String, String) {
-    let lines = body_lines(body_text);
+    split_half_from_lines(&body_lines(body_text))
+}
+
+/// `(first half, second half)` of `lines`, each dedented.
+pub fn split_half_from_lines(lines: &[&str]) -> (String, String) {
     let mid = lines.len() / 2;
     (dedent(&lines[..mid]), dedent(&lines[mid..]))
 }
@@ -187,6 +253,27 @@ mod tests {
         let mut r3 = ChaCha8Rng::seed_from_u64(8);
         let c = extract_noncontiguous_query(&body, 5, &mut r3);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn code_lines_skip_comments_and_braces() {
+        let body = "{\n    // leading comment\n    /*\n     * block\n     */\n    int a = f(1);\n\n    if (a > 0) { // trailing\n        g(a);\n    }\n}";
+        let m = record(1, body);
+        assert_eq!(code_lines(&m), vec!["    int a = f(1);", "    if (a > 0) { // trailing", "        g(a);", "    }"]);
+        assert_eq!(contiguous_from_lines(&code_lines(&m), 2), "int a = f(1);\nif (a > 0) { // trailing");
+        // Python: indentation of the first body line is kept.
+        let text = "def f(x):\n    # c\n    y = x\n    return y";
+        let py = MethodRecord {
+            id: MethodId(2),
+            lang: Lang::Python,
+            repo: "r".into(),
+            path: "a.py".into(),
+            name: "f".into(),
+            line_start: 1,
+            body: Span::new(text.find("# c").unwrap() as u32, text.len() as u32),
+            text: Arc::from(text),
+        };
+        assert_eq!(code_lines(&py), vec!["    y = x", "    return y"]);
     }
 
     #[test]

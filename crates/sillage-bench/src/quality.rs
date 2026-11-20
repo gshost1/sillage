@@ -21,7 +21,7 @@ use sillage_core::{FeatureBag, SimplifiedTree};
 use sillage_engine::{Engine, Recommendation, Timings};
 
 use crate::bootstrap::{mean, percentile};
-use crate::sample::{body_text, sample_methods, split_half_query};
+use crate::sample::{code_lines, sample_methods, split_half_from_lines};
 use crate::{PhaseLatency, QualityCfg, QualityReport};
 
 /// Minimum non-empty body lines for a quality sample (query gets ≥ 4 lines).
@@ -158,7 +158,7 @@ pub fn run(engine: &Engine, cfg: QualityCfg) -> anyhow::Result<QualityReport> {
     let mut outcomes = Vec::with_capacity(picks.len());
     for i in picks {
         let m = &methods[i];
-        let (query, held_text) = split_half_query(body_text(m));
+        let (query, held_text) = split_half_from_lines(&code_lines(m));
         if query.trim().is_empty() || held_text.trim().is_empty() {
             continue;
         }

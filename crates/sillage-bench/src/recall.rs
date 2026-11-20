@@ -8,8 +8,7 @@ use sillage_engine::Engine;
 
 use crate::bootstrap::bootstrap_hits;
 use crate::sample::{
-    MIN_BODY_LINES, QUERY_LINES, body_text, extract_contiguous_query, extract_noncontiguous_query,
-    sample_methods,
+    MIN_BODY_LINES, QUERY_LINES, code_lines, contiguous_from_lines, noncontiguous_from_lines, sample_methods,
 };
 use crate::{RecallCfg, RecallMode, RecallReport, RecallRow};
 
@@ -59,10 +58,10 @@ pub fn build_queries(engine: &Engine, cfg: &RecallCfg) -> Vec<RecallQuery> {
         .into_iter()
         .filter_map(|i| {
             let m = &methods[i];
-            let body = body_text(m);
+            let lines = code_lines(m);
             let snippet = match cfg.mode {
-                RecallMode::Contiguous => extract_contiguous_query(body, QUERY_LINES),
-                RecallMode::NonContiguous => extract_noncontiguous_query(body, QUERY_LINES, &mut rng),
+                RecallMode::Contiguous => contiguous_from_lines(&lines, QUERY_LINES),
+                RecallMode::NonContiguous => noncontiguous_from_lines(&lines, QUERY_LINES, &mut rng),
             };
             (!snippet.trim().is_empty()).then(|| RecallQuery {
                 orig: m.id,

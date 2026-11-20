@@ -145,7 +145,7 @@ fn java_scoping() {
     assert_local(t, "line");
     assert_local(t, "e");
     assert_local(t, "path");
-    assert_global(t, "count");
+    assert_local(t, "count"); // field: free names are locals (Decision 8, revised)
     assert_global(t, "readLine");
     assert_global(t, "append");
 
@@ -153,7 +153,7 @@ fn java_scoping() {
     assert_local(t, "x");
     assert_local(t, "fn");
     assert_local(t, "out");
-    assert_global(t, "items");
+    assert_local(t, "items"); // field: free names are locals (Decision 8, revised)
     assert_global(t, "toString");
     assert_global(t, "println");
 
@@ -161,7 +161,7 @@ fn java_scoping() {
     assert_local(t, "s");
     assert_local(t, "k");
     assert_local(t, "text");
-    assert_global(t, "outer");
+    assert_global(t, "outer"); // a label
 }
 
 #[test]

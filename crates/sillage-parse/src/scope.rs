@@ -376,8 +376,10 @@ impl<'a> Resolver<'a> {
             }
             Some(Binding::Global) => {}
             None => {
-                if !self.snippet
-                    || field_matches(&pinfo.callee, field)
+                // Decision 8 (revised): free value identifiers are locals in snippets
+                // *and* in corpus methods, so a field used as `player` in a method
+                // body and the same `player` in a query snippet both read `#VAR`.
+                if field_matches(&pinfo.callee, field)
                     || self.t.spec.builtins.contains(&name)
                     || uppercase_initial(name)
                     || (self.t.spec.free_global_hook)(node, parent, field)

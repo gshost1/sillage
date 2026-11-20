@@ -36,6 +36,30 @@ impl Wrapped {
         }
     }
 
+    /// Like [`Wrapped::around`], with `closers` (see [`closers`]) appended after the
+    /// snippet as phantom tokens.
+    fn closed(prefix: &str, s: &str, closers: &str, suffix: &str) -> Self {
+        let mut w = Self::around(prefix, s, "");
+        w.text.push('\n');
+        let start = w.text.len() as u32;
+        w.text.push_str(closers);
+        let end = w.text.len() as u32;
+        w.text.push_str(suffix);
+        w.map = w.map.with_phantom(start, end);
+        w
+    }
+
+    fn python_block_closed(s: &str, closers: &str) -> Self {
+        let mut w = Self::python_block(s);
+        let start = w.text.len() as u32;
+        w.text.push_str("    ");
+        w.text.push_str(closers);
+        let end = w.text.len() as u32;
+        w.text.push('\n');
+        w.map = w.map.with_phantom(start, end);
+        w
+    }
+
     /// `def __m():` with the snippet dedented and re-indented one level.
     fn python_block(s: &str) -> Self {
         let lead = |l: &str| l.len() - l.trim_start_matches([' ', '\t']).len();
@@ -216,30 +240,113 @@ pub(crate) fn parse_snippet(lang: Lang, s: &str) -> Result<SimplifiedTree> {
     if s.trim().is_empty() {
         return Ok(SimplifiedTree::empty(lang, Arc::from(s)));
     }
-    let candidates = match lang {
-        Lang::Java => vec![
-            Wrapped::around("class __S { void __m() {\n", s, "\n} }"),
-            Wrapped::around("class __S {\n", s, "\n}"),
-            Wrapped::raw(s),
-            Wrapped::around("class __S { Object __m() { return (\n", s, "\n); } }"),
+    let pairs: &[(&str, &str)] = match lang {
+        Lang::Java => &[
+            ("class __S { void __m() {\n", "\n} }"),
+            ("class __S {\n", "\n}"),
+            ("", ""),
+            ("class __S { Object __m() { return (\n", "\n); } }"),
         ],
-        Lang::Python => vec![Wrapped::raw(s), Wrapped::python_block(s)],
-        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => vec![
-            Wrapped::raw(s),
-            Wrapped::around("function __m() {\n", s, "\n}"),
-            Wrapped::around("class __S {\n", s, "\n}"),
-            Wrapped::around("(\n", s, "\n);"),
+        Lang::Python => &[("", "")],
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => &[
+            ("", ""),
+            ("function __m() {\n", "\n}"),
+            ("class __S {\n", "\n}"),
+            ("(\n", "\n);"),
         ],
-        Lang::Go => vec![
-            Wrapped::around("package p\nfunc __m() {\n", s, "\n}\n"),
-            Wrapped::raw(s),
-            Wrapped::around("package p\nvar __x = (\n", s, "\n)\n"),
+        Lang::Go => &[
+            ("package p\nfunc __m() {\n", "\n}\n"),
+            ("", ""),
+            ("package p\nvar __x = (\n", "\n)\n"),
         ],
-        Lang::Rust => vec![
-            Wrapped::around("fn __m() {\n", s, "\n}\n"),
-            Wrapped::raw(s),
-            Wrapped::around("impl __S {\n", s, "\n}\n"),
-        ],
+        Lang::Rust => &[("fn __m() {\n", "\n}\n"), ("", ""), ("impl __S {\n", "\n}\n")],
     };
+    // A partial query often stops inside a block or call (`if (x) {` …, `foo(a,`):
+    // try each wrapper first with the missing closers appended (kept as zero-width
+    // keywords), so the snippet's own constructs are closed by itself instead of by
+    // the wrapper's braces.
+    let cl = closers(lang, s);
+    let mut candidates = Vec::with_capacity(pairs.len() * 2 + 2);
+    for &(prefix, suffix) in pairs {
+        if !cl.is_empty() {
+            candidates.push(Wrapped::closed(prefix, s, &cl, suffix));
+        }
+        candidates.push(Wrapped::around(prefix, s, suffix));
+    }
+    if lang == Lang::Python {
+        if !cl.is_empty() {
+            candidates.push(Wrapped::python_block_closed(s, &cl));
+        }
+        candidates.push(Wrapped::python_block(s));
+    }
     parse_best(lang, s, candidates, true)
+}
+
+/// Closers for the brackets `s` leaves open, innermost first (e.g. `)}` for
+/// `if (x) {\n  foo(a,`). Strings, char literals and comments are skipped.
+pub(crate) fn closers(lang: Lang, s: &str) -> String {
+    let b = s.as_bytes();
+    let hash_comments = lang == Lang::Python;
+    let mut stack: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'/' if !hash_comments && b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if !hash_comments && b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'#' if hash_comments => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' | b'`' => {
+                let q = c;
+                let triple = hash_comments && b.get(i + 1) == Some(&q) && b.get(i + 2) == Some(&q);
+                i += if triple { 3 } else { 1 };
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == q && (!triple || (b.get(i + 1) == Some(&q) && b.get(i + 2) == Some(&q))) {
+                        i += if triple { 2 } else { 0 };
+                        break;
+                    }
+                    if b[i] == b'\n' && q == b'"' && !triple && !matches!(lang, Lang::Rust | Lang::Go) {
+                        break; // unterminated single-line string
+                    }
+                    i += 1;
+                }
+            }
+            b'\'' => {
+                // A char literal / Python or JS string — unless it is a Rust lifetime.
+                let close = b[i + 1..].iter().take(if matches!(lang, Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Tsx) { usize::MAX } else { 4 }).position(|&x| x == b'\'' || x == b'\n');
+                match close {
+                    Some(k) if b[i + 1 + k] == b'\'' => i += 1 + k,
+                    _ => {}
+                }
+            }
+            b'(' => stack.push(b')'),
+            b'[' => stack.push(b']'),
+            b'{' => stack.push(b'}'),
+            b')' | b']' | b'}' => {
+                if stack.last() == Some(&c) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    stack.iter().rev().map(|&c| c as char).collect()
 }

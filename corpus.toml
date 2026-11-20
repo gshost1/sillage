@@ -46,6 +46,34 @@ tag = "v33.3.1"
 rev = "df9602b6f1dd36414464229e0a441469d06e4575"
 lang = "java"
 
+[[repo]]
+name = "exoplayer"
+url = "https://github.com/google/ExoPlayer"
+tag = "r2.19.1"
+rev = "c31197048c10a9f021637ca1b7ba828ac0fd962d"
+lang = "java"
+
+[[repo]]
+name = "jackson-databind"
+url = "https://github.com/FasterXML/jackson-databind"
+tag = "jackson-databind-2.17.2"
+rev = "091d968751ef00150d22a788fe7f45b7cdcb337a"
+lang = "java"
+
+[[repo]]
+name = "gson"
+url = "https://github.com/google/gson"
+tag = "gson-parent-2.11.0"
+rev = "828a97be0f8d58108b140b77df8dc76b657f4a87"
+lang = "java"
+
+[[repo]]
+name = "javapoet"
+url = "https://github.com/square/javapoet"
+tag = "javapoet-1.13.0"
+rev = "714e05ca60179285746604452324262b126dcb2d"
+lang = "java"
+
 # --- Python --------------------------------------------------------------------
 
 [[repo]]

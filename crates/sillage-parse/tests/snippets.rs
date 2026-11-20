@@ -1,5 +1,6 @@
 //! Decision 8: free value identifiers in snippets are locals; callees, members,
-//! types, builtins and capitalised names are not. Full methods keep them global.
+//! types, builtins and capitalised names are not. Full methods use the same rule
+//! (Decision 8, revised) so fields read alike in queries and in the corpus.
 
 mod common;
 
@@ -46,7 +47,7 @@ fn free_identifiers_per_language() {
 }
 
 #[test]
-fn methods_keep_free_names_global() {
+fn methods_treat_free_names_as_locals() {
     let t = parse_method(
         Lang::Java,
         "void f(int a) { int b = a + limit; log(b); }",
@@ -55,8 +56,8 @@ fn methods_keep_free_names_global() {
     .unwrap();
     t.validate().unwrap();
     assert!(var(&t, "a").is_some() && var(&t, "b").is_some());
-    assert_eq!(var(&t, "limit"), None);
-    assert_eq!(var(&t, "log"), None);
+    assert!(var(&t, "limit").is_some(), "free value name (e.g. a field) is a local");
+    assert_eq!(var(&t, "log"), None, "callee");
 
     let t = parse_method(
         Lang::Python,
@@ -66,8 +67,8 @@ fn methods_keep_free_names_global() {
     .unwrap();
     t.validate().unwrap();
     assert!(var(&t, "a").is_some());
-    assert_eq!(var(&t, "g"), None);
-    assert_eq!(var(&t, "other"), None);
+    assert_eq!(var(&t, "g"), None, "declared `global`");
+    assert!(var(&t, "other").is_some());
 }
 
 #[test]
