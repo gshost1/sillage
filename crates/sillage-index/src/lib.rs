@@ -9,7 +9,7 @@ mod index;
 mod store;
 
 pub use bm25::{Bm25, tokenize};
-pub use corpus::{Corpus, build_corpus, build_corpus_and_index};
+pub use corpus::{Corpus, CorpusStats, build_corpus, build_corpus_and_index};
 pub use featurize::{AromaFeaturizer, PaperFeaturizer, feature_debug, query_feature_debug};
 pub use index::{COUNT_SAT, Hit, InvertedIndex};
-pub use store::{FORMAT_VERSION, load, save};
+pub use store::{FORMAT_VERSION, from_bytes, load, save, to_bytes};

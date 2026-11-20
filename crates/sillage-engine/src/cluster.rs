@@ -52,6 +52,17 @@ fn jaccard(a: &[usize], b: &[usize]) -> f64 {
     if union == 0 { 0.0 } else { inter as f64 / union as f64 }
 }
 
+/// Cheap necessary condition for `jaccard(a, b) > threshold` on strictly
+/// increasing tuples: Jaccard is at most `min(|a|, |b|) / max(|a|, |b|)`, and is
+/// 0 when the value ranges `[a_1, a_k]` and `[b_1, b_m]` are disjoint.
+fn may_exceed(a: &[usize], b: &[usize], threshold: f64) -> bool {
+    let (Some((&a0, &an)), Some((&b0, &bn))) = (a.first().zip(a.last()), b.first().zip(b.last())) else {
+        return false;
+    };
+    let (lo, hi) = if a.len() <= b.len() { (a.len(), b.len()) } else { (b.len(), a.len()) };
+    lo as f64 / hi as f64 > threshold && an >= b0 && bn >= a0
+}
+
 /// Clusters `N3` with their `l(τ)`/`s(τ)` scores, sorted and deduplicated.
 pub fn cluster_scored(
     _fq: &FeatureBag,
@@ -105,51 +116,59 @@ pub fn cluster_scored(
     let mut all: Vec<(Vec<usize>, f64, f64)> =
         frontier.iter().map(|t| (t.pos.clone(), t.l, t.s)).collect();
 
-    // C_{ℓ+1} = C_ℓ ∪ extensions; iterate until no new tuple appears.
-    while !frontier.is_empty() {
-        let extensions: Vec<Tuple> = frontier
-            .par_iter()
-            .flat_map_iter(|t| {
-                let last = *t.pos.last().expect("non-empty tuple");
-                let denom = denom_of(t.pos[0]);
-                // Decision 3: the max ranges over every eligible j > i_k, valid or not.
-                let scored: Vec<(usize, f64)> = (last + 1..eligible.len())
-                    .filter_map(|j| {
-                        let cs = t.cs_bag.intersect_count(&full_f[j]);
-                        let csq = t.csq_bag.intersect_count(&pruned_f[j]);
-                        ratios(cs, csq, denom).map(|(l, _)| (j, l))
-                    })
-                    .collect();
-                let max_l = scored.iter().map(|&(_, l)| l).fold(f64::NEG_INFINITY, f64::max);
-                let ties = match params.cluster_ties {
-                    ClusterTies::First => 1,
-                    ClusterTies::All => usize::MAX,
-                };
-                scored
-                    .into_iter()
-                    .filter(move |&(_, l)| (l - max_l).abs() <= EPS)
-                    .take(ties)
-                    .filter_map(move |(j, _)| {
-                        let cs_bag = t.cs_bag.intersect(&full_f[j]);
-                        let csq_bag = t.csq_bag.intersect(&pruned_f[j]);
-                        let (l, s) = ratios(cs_bag.total(), csq_bag.total(), denom)?;
-                        valid(l, s).then(|| {
-                            let mut pos = t.pos.clone();
-                            pos.push(j);
-                            Tuple { pos, cs_bag, csq_bag, l, s }
-                        })
-                    })
+    // C_{ℓ+1} = C_ℓ ∪ extensions; iterate until no new tuple appears. Each level
+    // is grown in chunks of the frontier so that `all` never exceeds MAX_TUPLES,
+    // even when one level of `ClusterTies::All` would produce far more tuples.
+    let ties = match params.cluster_ties {
+        ClusterTies::First => 1,
+        ClusterTies::All => usize::MAX,
+    };
+    let extend = |t: &Tuple| -> Vec<Tuple> {
+        let last = *t.pos.last().expect("non-empty tuple");
+        let denom = denom_of(t.pos[0]);
+        // Decision 3: the max ranges over every eligible j > i_k, valid or not.
+        let scored: Vec<(usize, f64)> = (last + 1..eligible.len())
+            .filter_map(|j| {
+                let cs = t.cs_bag.intersect_count(&full_f[j]);
+                let csq = t.csq_bag.intersect_count(&pruned_f[j]);
+                ratios(cs, csq, denom).map(|(l, _)| (j, l))
             })
             .collect();
-        frontier = extensions
+        let max_l = scored.iter().map(|&(_, l)| l).fold(f64::NEG_INFINITY, f64::max);
+        scored
             .into_iter()
-            .filter(|t| seen.insert(t.pos.clone()))
-            .collect();
-        all.extend(frontier.iter().map(|t| (t.pos.clone(), t.l, t.s)));
-        if all.len() >= MAX_TUPLES {
-            break;
+            .filter(|&(_, l)| (l - max_l).abs() <= EPS)
+            .take(ties)
+            .filter_map(|(j, _)| {
+                let cs_bag = t.cs_bag.intersect(&full_f[j]);
+                let csq_bag = t.csq_bag.intersect(&pruned_f[j]);
+                let (l, s) = ratios(cs_bag.total(), csq_bag.total(), denom)?;
+                valid(l, s).then(|| {
+                    let mut pos = t.pos.clone();
+                    pos.push(j);
+                    Tuple { pos, cs_bag, csq_bag, l, s }
+                })
+            })
+            .collect()
+    };
+    const CHUNK: usize = 64;
+    'grow: while !frontier.is_empty() && all.len() < MAX_TUPLES {
+        let mut next: Vec<Tuple> = Vec::new();
+        for chunk in frontier.chunks(CHUNK) {
+            let extensions: Vec<Tuple> = chunk.par_iter().flat_map_iter(extend).collect();
+            for t in extensions {
+                if all.len() >= MAX_TUPLES {
+                    break 'grow;
+                }
+                if seen.insert(t.pos.clone()) {
+                    all.push((t.pos.clone(), t.l, t.s));
+                    next.push(t);
+                }
+            }
         }
+        frontier = next;
     }
+    all.truncate(MAX_TUPLES);
 
     // Map to n2 indices, then sort by (first ASC, len DESC, tuple ASC).
     let mut tuples: Vec<ScoredCluster> = all
@@ -168,13 +187,12 @@ pub fn cluster_scored(
     });
 
     // Decision 4: Jaccard dedup against all earlier tuples or only kept ones.
+    let too_similar = |a: &[usize], b: &[usize]| may_exceed(a, b, params.jaccard) && jaccard(a, b) > params.jaccard;
     let mut kept: Vec<ScoredCluster> = Vec::new();
     for (idx, t) in tuples.iter().enumerate() {
         let dup = match params.dedup_against {
-            Dedup::AllEarlier => tuples[..idx]
-                .iter()
-                .any(|e| jaccard(&t.tuple, &e.tuple) > params.jaccard),
-            Dedup::KeptOnly => kept.iter().any(|e| jaccard(&t.tuple, &e.tuple) > params.jaccard),
+            Dedup::AllEarlier => tuples[..idx].iter().any(|e| too_similar(&t.tuple, &e.tuple)),
+            Dedup::KeptOnly => kept.iter().any(|e| too_similar(&t.tuple, &e.tuple)),
         };
         if !dup {
             kept.push(t.clone());
@@ -197,7 +215,23 @@ pub fn cluster(
 
 #[cfg(test)]
 mod tests {
-    use super::jaccard;
+    use super::{jaccard, may_exceed};
+
+    #[test]
+    fn may_exceed_is_a_sound_prefilter() {
+        let tuples: Vec<Vec<usize>> = vec![vec![0], vec![1], vec![0, 1], vec![0, 2], vec![0, 1, 2], vec![3, 4], vec![1, 2, 3, 4]];
+        for thr in [0.0, 0.3, 0.5, 0.9] {
+            for a in &tuples {
+                for b in &tuples {
+                    if jaccard(a, b) > thr {
+                        assert!(may_exceed(a, b, thr), "{a:?} {b:?} {thr}");
+                    }
+                }
+            }
+        }
+        assert!(!may_exceed(&[0, 1], &[2, 3], 0.0));
+        assert!(!may_exceed(&[0], &[0, 1, 2], 0.5));
+    }
 
     #[test]
     fn jaccard_basics() {

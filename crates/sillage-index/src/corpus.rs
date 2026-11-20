@@ -4,6 +4,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,44 @@ pub struct Corpus {
     pub methods: Vec<MethodRecord>,
 }
 
+impl Corpus {
+    /// Checks the invariants the engine relies on for a corpus loaded from disk:
+    /// `methods[i].id == MethodId(i)`, and every body span lies inside its text
+    /// on UTF-8 character boundaries.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (i, m) in self.methods.iter().enumerate() {
+            let expected = u32::try_from(i).map_err(|_| anyhow::anyhow!("more than u32::MAX methods"))?;
+            anyhow::ensure!(m.id == MethodId(expected), "method #{i} has id {} (expected M{i})", m.id);
+            let (s, e) = (m.body.start as usize, m.body.end as usize);
+            anyhow::ensure!(
+                s <= e && e <= m.text.len(),
+                "{}: body span {s}..{e} is outside its {}-byte text",
+                m.id,
+                m.text.len()
+            );
+            anyhow::ensure!(
+                m.text.is_char_boundary(s) && m.text.is_char_boundary(e),
+                "{}: body span {s}..{e} is not on UTF-8 character boundaries",
+                m.id
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What a corpus walk saw besides the extracted methods.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CorpusStats {
+    /// Source files (of the requested languages) read successfully.
+    pub files: usize,
+    /// Directory entries the walker could not read (permissions, broken links, …).
+    pub walk_errors: usize,
+    /// Source files that could not be read or are not valid UTF-8.
+    pub read_errors: usize,
+    /// Source files skipped for exceeding the size limit (generated / minified code).
+    pub skipped_large: usize,
+}
+
 struct SourceFile {
     repo: Box<str>,
     /// Path relative to the repo directory, `/`-separated.
@@ -33,16 +72,23 @@ struct SourceFile {
 /// project (`repo`); files directly under `root` belong to repo `"."`.
 /// Ordering is deterministic: methods are sorted by `(repo, path, line_start, name)`
 /// and assigned `MethodId(0..)`; the first occurrence of each duplicate is kept.
-pub fn build_corpus(root: &Path, langs: &[Lang]) -> Corpus {
-    let methods = collect(root, langs, |_| ());
-    Corpus { methods: methods.into_iter().map(|(m, ())| m).collect() }
+///
+/// Fails when `root` does not exist or is not a readable directory; unreadable
+/// entries below it are counted in [`CorpusStats`].
+pub fn build_corpus(root: &Path, langs: &[Lang]) -> anyhow::Result<(Corpus, CorpusStats)> {
+    let (methods, stats) = collect(root, langs, |_| ())?;
+    Ok((Corpus { methods: methods.into_iter().map(|(m, ())| m).collect() }, stats))
 }
 
 /// [`build_corpus`] and [`InvertedIndex::build`] in one pass: each method's tree
 /// from extraction is featurized directly instead of being re-parsed, giving
 /// exactly the same corpus and index.
-pub fn build_corpus_and_index(root: &Path, langs: &[Lang], featurizer: &dyn Featurizer) -> (Corpus, InvertedIndex) {
-    let methods = collect(root, langs, |m| feature_bag(&m.tree, featurizer));
+pub fn build_corpus_and_index(
+    root: &Path,
+    langs: &[Lang],
+    featurizer: &dyn Featurizer,
+) -> anyhow::Result<(Corpus, InvertedIndex, CorpusStats)> {
+    let (methods, stats) = collect(root, langs, |m| feature_bag(&m.tree, featurizer))?;
     let n = methods.len();
     let mut records = Vec::with_capacity(n);
     let mut bags = Vec::with_capacity(n);
@@ -50,7 +96,7 @@ pub fn build_corpus_and_index(root: &Path, langs: &[Lang], featurizer: &dyn Feat
         bags.push((rec.id, bag));
         records.push(rec);
     }
-    (Corpus { methods: records }, InvertedIndex::from_bags(bags, n))
+    Ok((Corpus { methods: records }, InvertedIndex::from_bags(bags, n), stats))
 }
 
 /// Walks, reads, deduplicates and extracts; `payload` is computed per extracted
@@ -59,29 +105,47 @@ fn collect<T: Send>(
     root: &Path,
     langs: &[Lang],
     payload: impl Fn(&sillage_parse::ExtractedMethod) -> T + Sync,
-) -> Vec<(MethodRecord, T)> {
-    let mut candidates: Vec<(PathBuf, Lang)> = ignore::WalkBuilder::new(root)
-        .build()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-        .filter(|e| e.metadata().map(|m| m.len() <= MAX_FILE_BYTES).unwrap_or(false))
-        .filter_map(|e| {
-            let lang = sillage_parse::lang_from_path(e.path())?;
-            langs.contains(&lang).then(|| (e.into_path(), lang))
-        })
-        .collect();
+) -> anyhow::Result<(Vec<(MethodRecord, T)>, CorpusStats)> {
+    let meta = std::fs::metadata(root).with_context(|| format!("corpus root {} is not accessible", root.display()))?;
+    anyhow::ensure!(meta.is_dir(), "corpus root {} is not a directory", root.display());
+    std::fs::read_dir(root).with_context(|| format!("corpus root {} is not readable", root.display()))?;
+
+    let mut stats = CorpusStats::default();
+    let mut candidates: Vec<(PathBuf, Lang)> = Vec::new();
+    for entry in ignore::WalkBuilder::new(root).build() {
+        let Ok(e) = entry else {
+            stats.walk_errors += 1;
+            continue;
+        };
+        if !e.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let Some(lang) = sillage_parse::lang_from_path(e.path()).filter(|l| langs.contains(l)) else {
+            continue;
+        };
+        match e.metadata() {
+            Ok(m) if m.len() <= MAX_FILE_BYTES => candidates.push((e.into_path(), lang)),
+            Ok(_) => stats.skipped_large += 1,
+            Err(_) => stats.walk_errors += 1,
+        }
+    }
     candidates.sort();
 
-    let mut files: Vec<SourceFile> = candidates
+    let read: Vec<Option<SourceFile>> = candidates
         .into_par_iter()
         .filter_map(|(abs, lang)| {
             let rel = abs.strip_prefix(root).ok()?;
             let (repo, path) = split_repo(rel)?;
-            let src = std::fs::read_to_string(&abs).ok()?;
+            let Ok(src) = std::fs::read_to_string(&abs) else {
+                return Some(None);
+            };
             let hash = content_hash(src.as_bytes());
-            Some(SourceFile { repo, path, lang, src, hash })
+            Some(Some(SourceFile { repo, path, lang, src, hash }))
         })
         .collect();
+    stats.read_errors = read.iter().filter(|f| f.is_none()).count();
+    let mut files: Vec<SourceFile> = read.into_iter().flatten().collect();
+    stats.files = files.len();
     files.sort_by(|a, b| (&a.repo, &a.path).cmp(&(&b.repo, &b.path)));
 
     let files = dedup_projects(files);
@@ -116,9 +180,9 @@ fn collect<T: Send>(
     let mut seen = FxHashSet::default();
     methods.retain(|(m, _)| seen.insert(method_hash(m)));
     for (i, (m, _)) in methods.iter_mut().enumerate() {
-        m.id = MethodId(i as u32);
+        m.id = MethodId(u32::try_from(i).map_err(|_| anyhow::anyhow!("corpus has more than u32::MAX methods"))?);
     }
-    methods
+    Ok((methods, stats))
 }
 
 fn split_repo(rel: &Path) -> Option<(Box<str>, Box<str>)> {

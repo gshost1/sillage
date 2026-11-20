@@ -17,23 +17,35 @@ pub fn mode_name(mode: RecallMode) -> &'static str {
     }
 }
 
-/// Table 4-style Markdown table: mean with 95% bootstrap CI per cell.
+/// Table 4-style Markdown table: mean with 95% bootstrap CI per cell, with
+/// both strict Recall@1 and §5 Recall@1 (see [`TIE_NOTE`]).
 pub fn recall_markdown(r: &RecallReport) -> String {
     let mut out = format!(
-        "### Recall ({}, {} queries)\n\n| System | Recall@1 (95% CI) | Recall@100 (95% CI) |\n|---|---|---|\n",
+        "### Recall ({}, {} queries)\n\n\
+         | System | Strict R@1 (95% CI) | §5 R@1 (95% CI) | R@100 (95% CI) |\n|---|---|---|---|\n",
         mode_name(r.mode),
         r.sampled
     );
     for row in &r.rows {
         out.push_str(&format!(
-            "| {} | {} | {} |\n",
+            "| {} | {} | {} | {} |\n",
             row.system,
+            ci_cell(&row.strict_recall_at_1),
             ci_cell(&row.recall_at_1),
             ci_cell(&row.recall_at_100)
         ));
     }
+    out.push('\n');
+    out.push_str(TIE_NOTE);
+    out.push('\n');
     out
 }
+
+/// How ties are scored, printed under every recall table.
+pub const TIE_NOTE: &str = "Strict R@1: the original method is ranked first. §5 R@1 adds the paper's \
+\"100% similar\" clause for Sillage only: an original tied with rank 1 counts when both reach the full \
+query similarity |F(q)|. BM25 and feature search break ties by method id and get no tie credit \
+(their two R@1 columns are equal).";
 
 pub fn recall_json(r: &RecallReport) -> String {
     serde_json::to_string_pretty(r).expect("recall report serializes")
@@ -43,7 +55,7 @@ pub fn quality_markdown(q: &QualityReport) -> String {
     format!(
         "### Recommendation quality (half-snippet queries, {} queries)\n\n\
          | Metric | Value |\n|---|---|\n\
-         | Containment rate (≥ τ1) | {} |\n\
+         | Containment rate (query-mode F(q), ≥ τ1) | {} |\n\
          | Avg precision of added features | {} |\n\
          | Avg recall of held-out features | {} |\n\
          | Avg recommendations / query | {:.2} |\n\
@@ -73,6 +85,9 @@ pub fn quality_markdown(q: &QualityReport) -> String {
         q.p95_ms,
         q.max_ms
     ) + &phase_table(q)
+        + "\nLeave-one-out: each query's own method is excluded before Phase II. Containment uses the \
+           engine's query-mode F(q); added-feature precision / recall use full featurization of the \
+           query, recommendation and held-out half.\n"
 }
 
 fn phase_table(q: &QualityReport) -> String {
@@ -108,11 +123,13 @@ mod tests {
                     system: "BM25 Keywords".into(),
                     recall_at_1: ci(0.123, 0.101, 0.1449),
                     recall_at_100: ci(0.5, 0.47, 0.53),
+                    strict_recall_at_1: ci(0.123, 0.101, 0.1449),
                 },
                 RecallRow {
                     system: "Sillage".into(),
                     recall_at_1: ci(0.991, 0.985, 0.996),
                     recall_at_100: ci(1.0, 1.0, 1.0),
+                    strict_recall_at_1: ci(0.95, 0.94, 0.96),
                 },
             ],
         }
@@ -123,10 +140,12 @@ mod tests {
         let md = recall_markdown(&recall_report());
         assert_eq!(
             md,
-            "### Recall (non-contiguous, 1000 queries)\n\n\
-             | System | Recall@1 (95% CI) | Recall@100 (95% CI) |\n|---|---|---|\n\
-             | BM25 Keywords | 12.3% [10.1%, 14.5%] | 50.0% [47.0%, 53.0%] |\n\
-             | Sillage | 99.1% [98.5%, 99.6%] | 100.0% [100.0%, 100.0%] |\n"
+            format!(
+                "### Recall (non-contiguous, 1000 queries)\n\n\
+                 | System | Strict R@1 (95% CI) | §5 R@1 (95% CI) | R@100 (95% CI) |\n|---|---|---|---|\n\
+                 | BM25 Keywords | 12.3% [10.1%, 14.5%] | 12.3% [10.1%, 14.5%] | 50.0% [47.0%, 53.0%] |\n\
+                 | Sillage | 95.0% [94.0%, 96.0%] | 99.1% [98.5%, 99.6%] | 100.0% [100.0%, 100.0%] |\n\n{TIE_NOTE}\n"
+            )
         );
     }
 
@@ -139,6 +158,7 @@ mod tests {
         assert_eq!(back.rows[1].system, "Sillage");
         let v: serde_json::Value = serde_json::from_str(&js).unwrap();
         assert_eq!(v["rows"][0]["recall_at_1"]["mean"], 0.123);
+        assert_eq!(v["rows"][1]["strict_recall_at_1"]["mean"], 0.95);
     }
 
     #[test]
@@ -162,7 +182,7 @@ mod tests {
         };
         let md = quality_markdown(&q);
         assert!(md.starts_with("### Recommendation quality (half-snippet queries, 200 queries)"));
-        assert!(md.contains("| Containment rate (≥ τ1) | 90.0% |"));
+        assert!(md.contains("| Containment rate (query-mode F(q), ≥ τ1) | 90.0% |"), "{md}");
         assert!(md.contains("| Exact-match rate (added lines ⊆ held-out) | 12.5% |"), "{md}");
         assert!(md.contains("| Cluster sizes (1 / 2 / 3–5 / 6+) | 5 / 2 / 1 / 0 |"), "{md}");
         assert!(md.contains("| Avg precision of added features | 45.7% |"));

@@ -142,6 +142,15 @@ fn load_rejects_bad_files() {
     std::fs::write(&bad_version, &bytes).unwrap();
     assert!(load(&bad_version).unwrap_err().to_string().contains("version 99"));
 
+    // Stage 5: pre-v4 files are rejected with a rebuild hint.
+    let old = dir.path().join("old");
+    let mut bytes = b"SILLAGE1".to_vec();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&[0; 32]);
+    std::fs::write(&old, &bytes).unwrap();
+    let err = load(&old).unwrap_err().to_string();
+    assert!(err.contains("version 3") && err.contains("sillage index"), "{err}");
+
     let truncated = dir.path().join("d");
     let mut bytes = b"SILLAGE1".to_vec();
     bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -150,4 +159,111 @@ fn load_rejects_bad_files() {
     assert!(load(&truncated).is_err());
 
     assert!(load(&dir.path().join("missing")).is_err());
+}
+
+fn valid_bytes() -> Vec<u8> {
+    let corpus = corpus();
+    let index = InvertedIndex::build(&corpus, &AromaFeaturizer);
+    let bm25 = Bm25::build(&corpus);
+    sillage_index::to_bytes(&corpus, &index, &bm25).unwrap()
+}
+
+/// Header: magic (8) + version (4) + xxh3 checksum (8).
+const HEADER: usize = 20;
+
+fn with_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
+    let sum = xxhash_rust::xxh3::xxh3_64(&bytes[HEADER..]);
+    bytes[12..HEADER].copy_from_slice(&sum.to_le_bytes());
+    bytes
+}
+
+/// Stage 5 regression: flipping any payload byte of a `.sil` file makes
+/// `load` return an error (checksum mismatch), never panic; so does truncation.
+#[test]
+fn load_rejects_flipped_bytes_without_panicking() {
+    let bytes = valid_bytes();
+    assert!(sillage_index::from_bytes(&bytes, "ok").is_ok());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("flipped.sil");
+    for pos in (HEADER..bytes.len()).step_by(7).chain([bytes.len() - 1]) {
+        let mut b = bytes.clone();
+        b[pos] ^= 0x5a;
+        std::fs::write(&path, &b).unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        assert!(err.contains("checksum"), "byte {pos}: {err}");
+    }
+    // Corrupted checksum field itself.
+    let mut b = bytes.clone();
+    b[13] ^= 1;
+    assert!(sillage_index::from_bytes(&b, "x").unwrap_err().to_string().contains("checksum"));
+    // Truncated anywhere.
+    for len in [0, 8, 12, 19, HEADER, bytes.len() / 2, bytes.len() - 1] {
+        assert!(sillage_index::from_bytes(&bytes[..len], "x").is_err(), "len {len}");
+    }
+}
+
+/// Stage 5 regression: even a corrupted payload with a *matching* checksum
+/// (e.g. a hand-edited file) decodes to an error or a structure that passes
+/// validation, and never panics.
+#[test]
+fn corrupted_payload_with_valid_checksum_never_panics() {
+    let bytes = valid_bytes();
+    let mut errors = 0;
+    for pos in HEADER..bytes.len() {
+        for mask in [0x01u8, 0x80, 0xff] {
+            let mut b = bytes.clone();
+            b[pos] ^= mask;
+            let b = with_checksum(b);
+            match std::panic::catch_unwind(|| sillage_index::from_bytes(&b, "x")) {
+                Ok(Ok((c, i, m))) => {
+                    // Whatever decoded must be safe to query.
+                    let q = AromaFeaturizer.featurize(&common::listing4()).total();
+                    let _ = i.search(&q, 10);
+                    let _ = m.search("view ViewGroup", 10);
+                    assert_eq!(i.num_methods(), c.methods.len());
+                }
+                Ok(Err(_)) => errors += 1,
+                Err(_) => panic!("from_bytes panicked at byte {pos} mask {mask:#x}"),
+            }
+        }
+    }
+    assert!(errors > 0);
+}
+
+/// Stage 5: structural validation catches inconsistent parts that decode fine.
+#[test]
+fn load_validates_structures() {
+    let good = corpus();
+    let index = InvertedIndex::build(&good, &AromaFeaturizer);
+    let bm25 = Bm25::build(&good);
+    let check = |c: &Corpus, i: &InvertedIndex, b: &Bm25| {
+        let bytes = sillage_index::to_bytes(c, i, b).unwrap();
+        sillage_index::from_bytes(&bytes, "x").map(|_| ()).map_err(|e| format!("{e:#}"))
+    };
+    assert!(check(&good, &index, &bm25).is_ok());
+
+    // Method ids out of order.
+    let mut c = good.clone();
+    c.methods.swap(0, 1);
+    assert!(check(&c, &index, &bm25).unwrap_err().contains("id"));
+
+    // Body span past the end of the text / off a char boundary.
+    let mut c = good.clone();
+    c.methods[2].body = Span::new(0, c.methods[2].text.len() as u32 + 5);
+    assert!(check(&c, &index, &bm25).unwrap_err().contains("body span"));
+    let mut c = good.clone();
+    c.methods[3].text = Arc::from("void m3() { é }");
+    c.methods[3].body = Span::new(0, 13);
+    assert!(check(&c, &index, &bm25).unwrap_err().contains("UTF-8"));
+    let mut c = good.clone();
+    c.methods[3].body = Span::new(5, 4);
+    assert!(check(&c, &index, &bm25).is_err());
+
+    // Index / BM25 built for a different number of methods.
+    let mut fewer = good.clone();
+    fewer.methods.pop();
+    let err = check(&fewer, &index, &Bm25::build(&fewer)).unwrap_err();
+    assert!(err.contains("inverted index") && err.contains("methods"), "{err}");
+    let err = check(&fewer, &InvertedIndex::build(&fewer, &AromaFeaturizer), &bm25).unwrap_err();
+    assert!(err.contains("BM25"), "{err}");
 }

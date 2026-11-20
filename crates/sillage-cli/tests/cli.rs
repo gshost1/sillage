@@ -141,3 +141,102 @@ fn cli_end_to_end() {
     let bad = sillage(&["explain", "-"], Some("x"));
     assert!(!bad.status.success() && String::from_utf8_lossy(&bad.stderr).contains("--lang"));
 }
+
+/// Stage 5 regressions: `search --format json` is one valid JSON document,
+/// indexing a missing / empty corpus fails, invalid parameters are rejected,
+/// and a missing `--lang` fails without waiting for stdin.
+#[test]
+fn cli_stage5_regressions() {
+    let dir = scratch("cli5");
+    let corpus = dir.path().join("corpus");
+    write_paper_corpus(&corpus);
+    let index = dir.path().join("java.sil");
+    let (c, i) = (corpus.to_str().unwrap(), index.to_str().unwrap());
+    ok(&["index", "--corpus", c, "--out", i, "--lang", "java"], None);
+    let q = dir.path().join("listing4.java");
+    std::fs::write(&q, LISTING4).unwrap();
+    let qs = q.to_str().unwrap();
+
+    // search --format json, with and without --show.
+    let out = ok(&["search", "--index", i, qs, "--n", "3", "--format", "json"], None);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(v["lang"], "java");
+    let rows = v["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    for (k, r) in rows.iter().enumerate() {
+        assert_eq!(r["rank"], k + 1);
+        for key in ["id", "repo", "path", "name", "line_start", "score", "sim", "overlap"] {
+            assert!(!r[key].is_null(), "{key} missing in {r}");
+        }
+        assert!(r.get("render").is_none());
+    }
+    let out = ok(&["search", "--index", i, qs, "--n", "2", "--format", "json", "--show", "--max-lines", "3"], None);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    let r0 = &v["results"][0];
+    let lines = r0["render"]["lines"].as_array().unwrap();
+    assert!(lines.len() <= 4, "{lines:?}");
+    let start = r0["line_start"].as_u64().unwrap();
+    assert_eq!(lines[0]["file_line"].as_u64().unwrap(), lines[0]["src_line"].as_u64().unwrap() + start - 1);
+    // stdin search with --lang, plain --show with --max-lines.
+    let out = ok(&["search", "--index", i, "--lang", "java", "--n", "1", "--show", "--format", "plain", "--max-lines", "2", "-"], Some(LISTING4));
+    assert!(out.contains("more line"), "{out}");
+
+    // Missing / empty corpus.
+    let missing = dir.path().join("nonexistent");
+    let bad = sillage(&["index", "--corpus", missing.to_str().unwrap(), "--out", dir.path().join("m.sil").to_str().unwrap()], None);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("not accessible"), "{}", String::from_utf8_lossy(&bad.stderr));
+    assert!(!dir.path().join("m.sil").exists());
+    let bad = sillage(&["index", "--corpus", "/nonexistent", "--out", dir.path().join("n.sil").to_str().unwrap()], None);
+    assert!(!bad.status.success());
+    let empty = dir.path().join("empty");
+    write(&empty, "docs/README.md", "# nothing to index\n");
+    let bad = sillage(&["index", "--corpus", empty.to_str().unwrap(), "--out", dir.path().join("e.sil").to_str().unwrap()], None);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("no methods found"), "{}", String::from_utf8_lossy(&bad.stderr));
+
+    // Parameter validation.
+    for (flag, val) in [
+        ("--tau1", "NaN"),
+        ("--tau1", "1.5"),
+        ("--tau2", "inf"),
+        ("--tau2", "-1"),
+        ("--tau3", "-0.1"),
+        ("--k", "0"),
+        ("--eta1", "0"),
+        ("--eta2", "0"),
+        ("--max-lines", "0"),
+    ] {
+        let bad = sillage(&["query", "--index", i, qs, flag, val], None);
+        assert!(!bad.status.success(), "{flag} {val} accepted");
+    }
+
+    // `.pyi` resolves like `sillage index` does.
+    let pyi = dir.path().join("stub.pyi");
+    std::fs::write(&pyi, "x = foo(y)\n").unwrap();
+    let out = ok(&["explain", pyi.to_str().unwrap()], None);
+    assert!(out.contains("python simplified parse tree"), "{out}");
+
+    // Missing --lang on stdin fails at once, with stdin still open.
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sillage"))
+        .args(["query", "--index", i])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take(); // kept open: no EOF
+    let t = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if t.elapsed().as_secs() > 20 {
+            child.kill().unwrap();
+            panic!("sillage waited for stdin before reporting the missing --lang");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(!status.success());
+}

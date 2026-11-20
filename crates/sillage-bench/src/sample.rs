@@ -5,7 +5,7 @@ use rand::seq::index;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use rayon::prelude::*;
-use sillage_core::{Lang, MethodRecord, NodeKind};
+use sillage_core::{MethodRecord, NodeKind};
 
 /// Paper §5: sampled method bodies have at least 12 lines of code.
 pub const MIN_BODY_LINES: usize = 12;
@@ -57,12 +57,8 @@ fn is_quote_start(text: &str) -> bool {
 /// multi-line string literal (a Python docstring or triple-quoted test fixture,
 /// a Rust raw-string help text): like Javadoc comments they hold no code, and a
 /// query starting inside one parses prose as code (Stage 3: Python Recall@1
-/// 56% → 93%).
-///
-/// Java is exempt only to keep its sampled query sets byte-identical to the
-/// Stage 2 baseline: in the 80k-method Java corpus the rule touches exactly one
-/// method (a JDK 21 text-block test, 12 → 7 code lines), but that one change to
-/// the eligible pool reshuffles the seeded sample.
+/// 56% → 93%). The rule applies uniformly to every language, Java text blocks
+/// included (Stage 5 removed a Java-only exemption).
 ///
 /// Lines are full source lines (with their indentation), clipped to the body
 /// span; falls back to [`body_lines`] when the method does not parse.
@@ -98,23 +94,21 @@ pub fn code_lines(m: &MethodRecord) -> Vec<&str> {
         }
         code[line_of(n.span.start as usize)..=line_of(n.span.end as usize - 1)].fill(true);
     }
-    if m.lang != Lang::Java {
-        // Interior lines of a multi-line string, atomic (`"""doc"""`) or
-        // structural (an f-string / template literal with interpolations, whose
-        // first child is the opening quote keyword, e.g. `f"""`).
-        for n in &tree.nodes {
-            let string = match &n.kind {
-                NodeKind::Token { .. } => is_string_literal(&n.kind),
-                NodeKind::Internal { .. } => n.children.first().is_some_and(|&c| {
-                    matches!(&tree.node(c).kind, NodeKind::Keyword { text } if is_quote_start(text))
-                }),
-                NodeKind::Keyword { .. } => false,
-            };
-            if string && !n.span.is_empty() {
-                let (first, last) = (line_of(n.span.start as usize), line_of(n.span.end as usize - 1));
-                if last > first + 1 {
-                    code[first + 1..last].fill(false);
-                }
+    // Interior lines of a multi-line string, atomic (`"""doc"""`) or
+    // structural (an f-string / template literal with interpolations, whose
+    // first child is the opening quote keyword, e.g. `f"""`).
+    for n in &tree.nodes {
+        let string = match &n.kind {
+            NodeKind::Token { .. } => is_string_literal(&n.kind),
+            NodeKind::Internal { .. } => n.children.first().is_some_and(|&c| {
+                matches!(&tree.node(c).kind, NodeKind::Keyword { text } if is_quote_start(text))
+            }),
+            NodeKind::Keyword { .. } => false,
+        };
+        if string && !n.span.is_empty() {
+            let (first, last) = (line_of(n.span.start as usize), line_of(n.span.end as usize - 1));
+            if last > first + 1 {
+                code[first + 1..last].fill(false);
             }
         }
     }
@@ -329,8 +323,8 @@ mod tests {
     }
 
     /// Stage 3: interior lines of a multi-line string (docstring, triple-quoted
-    /// fixture, interpolated f-string) are not code lines in Python; its first
-    /// and last lines are. Java keeps every line a terminal touches.
+    /// fixture, interpolated f-string) are not code lines; its first and last
+    /// lines are. Stage 5: the same rule applies to Java text blocks.
     #[test]
     fn code_lines_skip_multiline_string_interiors() {
         let text = "def f(t):\n    \"\"\"Doc line one.\n    Doc line two.\n    \"\"\"\n    t.make(\n        \"\"\"\n        import x\n        \"\"\"\n    )\n    s = f\"\"\"\n    a {t}\n    b\"\"\"\n    return s";
@@ -352,7 +346,11 @@ mod tests {
         );
         let body = "{\n    String s = \"\"\"\n        text block\n        \"\"\";\n    use(s);\n}";
         let j = record(4, body);
-        assert_eq!(code_lines(&j).len(), 4, "Java keeps text-block lines");
+        assert_eq!(
+            code_lines(&j),
+            ["    String s = \"\"\"", "        \"\"\";", "    use(s);"],
+            "Java text-block interiors are skipped like any other language's"
+        );
     }
 
     #[test]

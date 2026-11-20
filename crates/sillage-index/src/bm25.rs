@@ -51,11 +51,12 @@ impl Bm25 {
             let mut len = 0u32;
             for w in tokenize(text) {
                 *tf.entry(w).or_insert(0) += 1;
-                len += 1;
+                len = len.checked_add(1).expect("document longer than u32::MAX tokens");
             }
             doc_ids.push(id);
             doc_len.push(len);
-            triples.extend(tf.drain().map(|(w, c)| (w.into_boxed_str(), d as u32, c)));
+            let d = u32::try_from(d).expect("more than u32::MAX BM25 documents");
+            triples.extend(tf.drain().map(|(w, c)| (w.into_boxed_str(), d, c)));
         }
         triples.sort_unstable();
 
@@ -66,7 +67,7 @@ impl Bm25 {
         for (w, d, c) in triples {
             if terms.last() != Some(&w) {
                 if !terms.is_empty() {
-                    offsets.push(post_docs.len() as u32);
+                    offsets.push(csr_offset(post_docs.len()));
                 }
                 terms.push(w);
             }
@@ -74,7 +75,7 @@ impl Bm25 {
             post_tf.push(c);
         }
         if !terms.is_empty() {
-            offsets.push(post_docs.len() as u32);
+            offsets.push(csr_offset(post_docs.len()));
         }
 
         let total: u64 = doc_len.iter().map(|&l| u64::from(l)).sum();
@@ -85,6 +86,12 @@ impl Bm25 {
     /// Top-`n` documents by BM25 score, sorted by `(score DESC, MethodId ASC)`.
     /// Only documents sharing at least one query term are returned.
     pub fn search(&self, query: &str, n: usize) -> Vec<(MethodId, f64)> {
+        self.search_where(query, n, |_| true)
+    }
+
+    /// [`search`](Self::search) restricted to documents whose method satisfies
+    /// `keep` (applied before the top-`n` cut).
+    pub fn search_where(&self, query: &str, n: usize, keep: impl Fn(MethodId) -> bool) -> Vec<(MethodId, f64)> {
         if n == 0 || self.doc_ids.is_empty() {
             return Vec::new();
         }
@@ -115,7 +122,7 @@ impl Bm25 {
         let mut hits: Vec<(MethodId, f64)> = touched
             .iter()
             .enumerate()
-            .filter(|&(_, &t)| t)
+            .filter(|&(d, &t)| t && keep(self.doc_ids[d]))
             .map(|(d, _)| (self.doc_ids[d], scores[d]))
             .collect();
         let cmp = |a: &(MethodId, f64), b: &(MethodId, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
@@ -130,6 +137,48 @@ impl Bm25 {
     pub fn num_terms(&self) -> usize {
         self.terms.len()
     }
+
+    /// Checks every invariant [`search`](Self::search) relies on, for a BM25
+    /// index loaded from disk over a corpus of `expected_methods` methods.
+    pub fn validate(&self, expected_methods: usize) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        let docs = self.doc_ids.len();
+        ensure!(docs == expected_methods, "BM25 has {docs} documents but the corpus has {expected_methods}");
+        ensure!(self.doc_len.len() == docs, "{} document lengths for {docs} documents", self.doc_len.len());
+        ensure!(
+            self.doc_ids.iter().all(|id| (id.0 as usize) < expected_methods),
+            "BM25 document id out of range"
+        );
+        if self.terms.is_empty() {
+            ensure!(self.offsets.len() <= 1, "{} offsets for 0 terms", self.offsets.len());
+        } else {
+            ensure!(
+                self.offsets.len() == self.terms.len() + 1,
+                "{} offsets for {} terms",
+                self.offsets.len(),
+                self.terms.len()
+            );
+        }
+        ensure!(self.offsets.first().is_none_or(|&o| o == 0), "first BM25 offset is not 0");
+        ensure!(self.offsets.windows(2).all(|w| w[0] <= w[1]), "BM25 offsets are not non-decreasing");
+        let last = self.offsets.last().map_or(0, |&o| o as usize);
+        ensure!(last == self.post_docs.len(), "last BM25 offset {last} != {} postings", self.post_docs.len());
+        ensure!(
+            self.post_tf.len() == self.post_docs.len(),
+            "{} term frequencies for {} postings",
+            self.post_tf.len(),
+            self.post_docs.len()
+        );
+        ensure!(self.post_docs.iter().all(|&d| (d as usize) < docs), "BM25 posting out of range");
+        ensure!(self.terms.windows(2).all(|w| w[0] < w[1]), "BM25 terms are not strictly increasing");
+        ensure!(self.avgdl.is_finite() && self.avgdl >= 0.0, "BM25 avgdl {} is invalid", self.avgdl);
+        Ok(())
+    }
+}
+
+/// A CSR offset, refusing (instead of silently wrapping) past `u32::MAX`.
+fn csr_offset(len: usize) -> u32 {
+    u32::try_from(len).expect("more than u32::MAX BM25 postings")
 }
 
 /// Identifier and number words, case-sensitive and whole (`getChildCount`,
@@ -154,5 +203,45 @@ mod tests {
     fn tokenize_keeps_whole_case_sensitive_identifiers() {
         let words: Vec<String> = tokenize("x.getChildCount() + HTTPServer_v2; $el = 42").collect();
         assert_eq!(words, ["x", "getChildCount", "HTTPServer_v2", "$el", "42"]);
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    #[test]
+    fn validate_catches_inconsistent_postings() {
+        let docs = [(MethodId(0), "a b c"), (MethodId(1), "b c d"), (MethodId(2), "x")];
+        let good = Bm25::build_from_texts(&docs);
+        good.validate(3).unwrap();
+        assert!(good.validate(2).is_err());
+        let mut x = good.clone();
+        x.post_docs[0] = 9;
+        assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        x.offsets.swap(1, 2);
+        assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        x.post_tf.pop();
+        assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        x.doc_len.pop();
+        assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        x.doc_ids[1] = MethodId(7);
+        assert!(x.validate(3).is_err());
+        let mut x = good;
+        x.avgdl = f64::NAN;
+        assert!(x.validate(3).is_err());
+        Bm25::build_from_texts(&[]).validate(0).unwrap();
+    }
+
+    #[test]
+    fn search_where_filters_before_the_cut() {
+        let docs = [(MethodId(0), "a a a"), (MethodId(1), "a")];
+        let b = Bm25::build_from_texts(&docs);
+        assert_eq!(b.search("a", 1)[0].0, MethodId(0));
+        assert_eq!(b.search_where("a", 1, |id| id != MethodId(0))[0].0, MethodId(1));
     }
 }

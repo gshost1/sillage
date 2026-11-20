@@ -3,11 +3,15 @@
 //! For each sampled method, the first half of its non-empty body lines is the
 //! query and the second half is held out. Per recommendation `r`:
 //!
-//! * containment `|F(q) ∩ F(r)| / |F(q)|`; a query is *contained* when some
+//! * containment `|F_q(q) ∩ F(r)| / |F_q(q)|`, where `F_q` is the engine's
+//!   *query-mode* featurization (`Featurizer::featurize_query`, the features
+//!   Phase II actually matches against `τ1`); a query is *contained* when some
 //!   recommendation reaches `params.tau1`;
 //! * added features `A = F(r) \ F(q)` (multiset difference), scored against
 //!   the held-out features `H = F(held)`: precision `|A ∩ H| / |A|`,
-//!   recall `|A ∩ H| / |H|`.
+//!   recall `|A ∩ H| / |H|`. Here `F(q)` and `F(held)` use the *full*
+//!   featurization, the same one `F(r)` uses, so the difference and the
+//!   comparison with the held-out half are like-for-like.
 //!
 //! The best recommendation per query (by F1) is reported. Line-level metrics
 //! compare the *rendered* recommendation with the held-out text: added lines
@@ -15,8 +19,9 @@
 //! a query is an *exact match* when some recommendation's added lines all occur
 //! in the held-out half. Precision/recall are
 //! averaged over queries that produced at least one recommendation.
-//! Recommendations whose cluster contains the query's own method are excluded
-//! (leave-one-out), since the original is in the indexed corpus.
+//! The query's own method is in the indexed corpus, so it is excluded from the
+//! engine's candidates *before* Phase II (`Engine::recommend_excluding`):
+//! leave-one-out, without the original occupying N2, cluster or top-k slots.
 
 use std::collections::{BTreeSet, HashSet};
 use std::time::Instant;
@@ -124,9 +129,11 @@ pub struct QueryOutcome {
 }
 
 /// Scores the kept recommendations of one query (`query` / `held_text` are the
-/// two halves of the method).
+/// two halves of the method). `fq_match` is the query-mode `F(q)` used for the
+/// containment check, `fq` the full `F(q)` used for added features.
 pub fn score_recommendations(
     engine: &Engine,
+    fq_match: &FeatureBag,
     fq: &FeatureBag,
     held: &FeatureBag,
     query: &str,
@@ -146,7 +153,7 @@ pub fn score_recommendations(
             out.line_best = Some((lp, lr));
         }
         let fr = engine.featurizer.featurize(&rec.tree).total();
-        if containment(fq, &fr) >= engine.params.tau1 {
+        if containment(fq_match, &fr) >= engine.params.tau1 {
             out.contained = true;
         }
         let pr = added_precision_recall(fq, &fr, held);
@@ -232,11 +239,12 @@ pub fn run(engine: &Engine, cfg: QualityCfg) -> anyhow::Result<QualityReport> {
         ) else {
             continue;
         };
+        let fq_match = engine.featurizer.featurize_query(&qt).total();
         let fq = engine.featurizer.featurize(&qt).total();
         let held = engine.featurizer.featurize(&ht).total();
         // Latency is measured sequentially so the percentiles are not skewed by contention.
         let t0 = Instant::now();
-        let Ok(output) = engine.recommend(m.lang, &query) else {
+        let Ok(output) = engine.recommend_excluding(m.lang, &query, &[m.id]) else {
             continue;
         };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -253,12 +261,9 @@ pub fn run(engine: &Engine, cfg: QualityCfg) -> anyhow::Result<QualityReport> {
                 m.name
             );
         }
-        let kept: Vec<&Recommendation> = output
-            .recommendations
-            .iter()
-            .filter(|r| !r.cluster.contains(&m.id))
-            .collect();
-        let mut o = score_recommendations(engine, &fq, &held, &query, &held_text, &kept);
+        debug_assert!(output.recommendations.iter().all(|r| !r.cluster.contains(&m.id)));
+        let kept: Vec<&Recommendation> = output.recommendations.iter().collect();
+        let mut o = score_recommendations(engine, &fq_match, &fq, &held, &query, &held_text, &kept);
         o.ms = ms;
         o.timings = output.timings.clone();
         outcomes.push(o);

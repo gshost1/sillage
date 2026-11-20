@@ -132,7 +132,7 @@ pub fn write_paper_corpus(root: &Path) {
 
 /// Real pipeline: walk → index → BM25 → save → load → engine.
 pub fn engine_for(corpus_dir: &Path, langs: &[Lang], index_path: &Path) -> Engine {
-    let (corpus, inv) = sillage_index::build_corpus_and_index(corpus_dir, langs, &AromaFeaturizer);
+    let (corpus, inv, _) = sillage_index::build_corpus_and_index(corpus_dir, langs, &AromaFeaturizer).unwrap();
     assert!(!corpus.methods.is_empty(), "empty corpus under {}", corpus_dir.display());
     let bm25 = Bm25::build(&corpus);
     sillage_index::save(index_path, &corpus, &inv, &bm25).unwrap();

@@ -30,10 +30,10 @@ fn main() -> anyhow::Result<()> {
     let terms = bm25.num_terms();
     let engine = Engine::new(corpus, inv, bm25, Box::new(AromaFeaturizer), Params::default());
     let queries = build_queries(&engine, &RecallCfg { n, mode, bootstrap: 0, seed });
-    let hits: Vec<(bool, bool)> =
-        queries.par_iter().map(|q| id_hits(q.orig, &engine.bm25_search(&q.snippet, 100))).collect();
-    let r1 = hits.iter().filter(|h| h.0).count() as f64 / hits.len().max(1) as f64;
-    let r100 = hits.iter().filter(|h| h.1).count() as f64 / hits.len().max(1) as f64;
+    let hits: Vec<_> =
+        queries.par_iter().map(|q| id_hits(q.orig, &engine.bm25_search(q.lang, &q.snippet, 100))).collect();
+    let r1 = hits.iter().filter(|h| h.r1).count() as f64 / hits.len().max(1) as f64;
+    let r100 = hits.iter().filter(|h| h.r100).count() as f64 / hits.len().max(1) as f64;
     println!("{mode:?} n={} terms={terms} BM25 R@1 {:.1}% R@100 {:.1}%", hits.len(), 100.0 * r1, 100.0 * r100);
     Ok(())
 }

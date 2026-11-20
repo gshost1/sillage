@@ -89,6 +89,11 @@ fn many_identical_candidates_do_not_explode() {
     let t = std::time::Instant::now();
     let _ = cluster(&fq, &n2, &capped, &TokenFeaturizer);
     assert!(t.elapsed().as_secs() < 60, "{:?}", t.elapsed());
+    // Stage 5: the cap holds *within* a level too. Without dedup, level 3 alone
+    // has C(60, 3) = 34,220 tuples; growth must stop at exactly MAX_TUPLES.
+    let no_dedup = Params { jaccard: 1.0, ..capped };
+    let all = cluster_scored(&fq, &n2, &no_dedup, &TokenFeaturizer);
+    assert_eq!(all.len(), sillage_core::MAX_TUPLES);
 }
 
 #[test]

@@ -54,7 +54,7 @@ pub enum Command {
         format: Format,
         /// Truncate each recommendation to N lines, ending with
         /// `// ... (K more lines)` (useful for long full-body singletons).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_positive)]
         max_lines: Option<usize>,
         #[command(flatten)]
         params: ParamArgs,
@@ -68,11 +68,15 @@ pub enum Command {
         /// Number of results to print.
         #[arg(long, default_value_t = 10)]
         n: usize,
-        /// Also render each result with the query-matching lines unmarked.
+        /// Also render each result with the query-matching lines unmarked
+        /// (with `--format json`, adds a `render` object to each result).
         #[arg(long)]
         show: bool,
         #[arg(long, value_enum, default_value_t = Format::Ansi)]
         format: Format,
+        /// Truncate each rendered result to N lines (with `--show`).
+        #[arg(long, value_name = "N", value_parser = parse_positive)]
+        max_lines: Option<usize>,
         #[command(flatten)]
         params: ParamArgs,
     },
@@ -139,24 +143,51 @@ pub struct SnippetInput {
 
 #[derive(Debug, Args, Default)]
 pub struct ParamArgs {
-    /// Recommendations to return (paper: 5).
-    #[arg(long)]
+    /// Recommendations to return (paper: 5; at least 1).
+    #[arg(long, value_parser = parse_positive)]
     pub k: Option<usize>,
-    /// Phase I candidates (paper: 1000).
-    #[arg(long)]
+    /// Phase I candidates (paper: 1000; at least 1).
+    #[arg(long, value_parser = parse_positive)]
     pub eta1: Option<usize>,
-    /// Phase III candidates (paper: 100).
-    #[arg(long)]
+    /// Phase III candidates (paper: 100; at least 1).
+    #[arg(long, value_parser = parse_positive)]
     pub eta2: Option<usize>,
-    /// Pruned-similarity threshold (paper: 0.65).
-    #[arg(long)]
+    /// Pruned-similarity threshold in [0, 1] (paper: 0.65).
+    #[arg(long, value_parser = parse_unit)]
     pub tau1: Option<f64>,
-    /// Cluster extension-ratio threshold (paper: 1.5).
-    #[arg(long)]
+    /// Cluster extension-ratio threshold, finite and >= 0 (paper: 1.5).
+    #[arg(long, value_parser = parse_non_negative)]
     pub tau2: Option<f64>,
-    /// Cluster query-alignment threshold (paper: 0.9).
-    #[arg(long)]
+    /// Cluster query-alignment threshold in [0, 1] (paper: 0.9).
+    #[arg(long, value_parser = parse_unit)]
     pub tau3: Option<f64>,
+}
+
+/// A count that must be at least 1.
+fn parse_positive(s: &str) -> Result<usize, String> {
+    match s.trim().parse::<usize>() {
+        Ok(0) => Err("must be at least 1".into()),
+        Ok(v) => Ok(v),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// A finite, non-negative real number (rejects NaN and infinities).
+fn parse_non_negative(s: &str) -> Result<f64, String> {
+    let v: f64 = s.trim().parse().map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("must be a finite number >= 0, got {s}"));
+    }
+    Ok(v)
+}
+
+/// A threshold in `[0, 1]`.
+fn parse_unit(s: &str) -> Result<f64, String> {
+    let v = parse_non_negative(s)?;
+    if v > 1.0 {
+        return Err(format!("must be between 0 and 1, got {s}"));
+    }
+    Ok(v)
 }
 
 impl ParamArgs {
@@ -228,8 +259,10 @@ impl SnippetInput {
         self.file.as_deref().is_none_or(|p| p == Path::new("-"))
     }
 
-    /// Reads the snippet and resolves its language.
+    /// Resolves the snippet language, then reads the snippet. The language is
+    /// resolved first, so a missing `--lang` fails before blocking on stdin.
     fn read(&self) -> anyhow::Result<(Lang, String)> {
+        let lang = self.resolve_lang()?;
         let text = if self.is_stdin() {
             let mut s = String::new();
             std::io::stdin().read_to_string(&mut s).context("reading stdin")?;
@@ -238,19 +271,19 @@ impl SnippetInput {
             let p = self.file.as_deref().expect("file");
             std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
         };
-        Ok((self.resolve_lang()?, text))
+        Ok((lang, text))
     }
 
+    /// `--lang`, else the file extension, mapped exactly as `sillage index` maps
+    /// corpus files (`sillage_parse::lang_from_path`: `.pyi`, `.mts`, `.cjs`, …).
     fn resolve_lang(&self) -> anyhow::Result<Lang> {
         if let Some(l) = self.lang {
             return Ok(l);
         }
-        if !self.is_stdin() {
-            if let Some(ext) = self.file.as_deref().and_then(Path::extension) {
-                if let Ok(l) = ext.to_string_lossy().parse::<Lang>() {
-                    return Ok(l);
-                }
-            }
+        if !self.is_stdin()
+            && let Some(l) = self.file.as_deref().and_then(sillage_parse::lang_from_path)
+        {
+            return Ok(l);
         }
         bail!("cannot infer the snippet language; pass --lang")
     }
@@ -305,7 +338,25 @@ fn cmd_fetch(manifest_path: &Path, out: &Path) -> anyhow::Result<()> {
 fn cmd_index(corpus_dir: &Path, out: &Path, langs: &[Lang]) -> anyhow::Result<()> {
     let langs: Vec<Lang> = if langs.is_empty() { Lang::ALL.to_vec() } else { langs.to_vec() };
     let t0 = std::time::Instant::now();
-    let (corpus, inv) = sillage_index::build_corpus_and_index(corpus_dir, &langs, &AromaFeaturizer);
+    let (corpus, inv, stats) = sillage_index::build_corpus_and_index(corpus_dir, &langs, &AromaFeaturizer)?;
+    if stats.walk_errors > 0 {
+        eprintln!("warning: {} directory entries under {} could not be read", stats.walk_errors, corpus_dir.display());
+    }
+    if stats.read_errors > 0 {
+        eprintln!("warning: {} source files could not be read or are not valid UTF-8", stats.read_errors);
+    }
+    if stats.skipped_large > 0 {
+        eprintln!("note: skipped {} source files larger than 2 MiB", stats.skipped_large);
+    }
+    if corpus.methods.is_empty() {
+        let names: Vec<&str> = langs.iter().map(|l| l.as_str()).collect();
+        bail!(
+            "no methods found under {} ({} source files read, languages: {}); nothing to index",
+            corpus_dir.display(),
+            stats.files,
+            names.join(", ")
+        );
+    }
     let bm25 = Bm25::build(&corpus);
     sillage_index::save(out, &corpus, &inv, &bm25)?;
     println!(
@@ -406,12 +457,53 @@ fn cmd_search(
     n: usize,
     show: bool,
     format: Format,
+    max_lines: Option<usize>,
     params: &ParamArgs,
 ) -> anyhow::Result<()> {
     let (lang, snippet) = input.read()?;
     let engine = load_engine(index, params.to_params())?;
     let results = engine.search(lang, &snippet, n)?;
     let lookup = method_lookup(&engine);
+    // Each result's tree is its method's full text, starting at `line_start`.
+    let layout_of = |r: &sillage_engine::Ranked| {
+        let mut lay = sillage_render::layout(&r.tree, &r.pruned.keep, Some(&snippet));
+        if let Some(m) = lookup.get(&r.id) {
+            lay.locate(m.line_start as usize);
+        }
+        if let Some(n) = max_lines {
+            lay.truncate(n);
+        }
+        lay
+    };
+    if format == Format::Json {
+        let rows: Vec<serde_json::Value> = results
+            .iter()
+            .take(n)
+            .enumerate()
+            .map(|(rank, r)| {
+                let mut row = serde_json::json!({
+                    "rank": rank + 1,
+                    "id": r.id.0,
+                    "score": r.score,
+                    "sim": r.sim,
+                    "overlap": r.overlap,
+                });
+                if let Some(m) = lookup.get(&r.id) {
+                    row["repo"] = serde_json::json!(&*m.repo);
+                    row["path"] = serde_json::json!(&*m.path);
+                    row["name"] = serde_json::json!(&*m.name);
+                    row["line_start"] = serde_json::json!(m.line_start);
+                }
+                if show {
+                    row["render"] = sillage_render::json::to_value(&layout_of(r));
+                }
+                row
+            })
+            .collect();
+        let doc = serde_json::json!({ "lang": lang.as_str(), "results": rows });
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+        return Ok(());
+    }
     for (rank, r) in results.iter().take(n).enumerate() {
         println!(
             "{:>3}. score {:.3}  sim {:>4}  overlap {:>4}  {}",
@@ -422,7 +514,7 @@ fn cmd_search(
             describe(lookup.get(&r.id), r.id)
         );
         if show {
-            print!("{}", sillage_render::render(&r.tree, &r.pruned.keep, Some(&snippet), format.into()));
+            print!("{}", sillage_render::render_layout(&layout_of(r), format.into()));
             println!();
         }
     }
@@ -496,8 +588,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Query { index, input, format, max_lines, params } => {
             cmd_query(&index, &input, format, max_lines, &params)
         }
-        Command::Search { index, input, n, show, format, params } => {
-            cmd_search(&index, &input, n, show, format, &params)
+        Command::Search { index, input, n, show, format, max_lines, params } => {
+            cmd_search(&index, &input, n, show, format, max_lines, &params)
         }
         Command::Explain { input } => cmd_explain(&input),
         Command::Stats { index } => cmd_stats(&index),

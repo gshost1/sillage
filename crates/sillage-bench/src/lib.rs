@@ -26,7 +26,7 @@ pub struct RecallCfg {
     pub seed: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Ci {
     pub mean: f64,
     pub low: f64,
@@ -36,8 +36,13 @@ pub struct Ci {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallRow {
     pub system: String,
+    /// §5 Recall@1: strict, plus Sillage's "100% similar" exact-tie credit
+    /// (Decision 9; equal to the strict value for the baselines).
     pub recall_at_1: Ci,
     pub recall_at_100: Ci,
+    /// Strict Recall@1: the original method is ranked first.
+    #[serde(default)]
+    pub strict_recall_at_1: Ci,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

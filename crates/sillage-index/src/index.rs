@@ -108,7 +108,8 @@ impl InvertedIndex {
                 let idx = bag
                     .iter()
                     .map(|&(f, c)| {
-                        let d = feature_ids.binary_search(&f).expect("feature present") as u32;
+                        let d = feature_ids.binary_search(&f).expect("feature present");
+                        let d = u32::try_from(d).expect("more than u32::MAX distinct features");
                         (d, c.min(u32::from(COUNT_SAT)) as u8)
                     })
                     .collect();
@@ -119,11 +120,14 @@ impl InvertedIndex {
         let mut offsets = vec![0u32; feature_ids.len() + 1];
         for (_, idx) in &dense {
             for &(f, _) in idx {
-                offsets[f as usize + 1] += 1;
+                let o = &mut offsets[f as usize + 1];
+                *o = o.checked_add(1).expect("more than u32::MAX postings for one feature");
             }
         }
         for i in 1..offsets.len() {
-            offsets[i] += offsets[i - 1];
+            offsets[i] = offsets[i]
+                .checked_add(offsets[i - 1])
+                .expect("more than u32::MAX postings in the inverted index");
         }
         let total = *offsets.last().unwrap_or(&0) as usize;
         let mut cursor: Vec<u32> = offsets[..offsets.len() - 1].to_vec();
@@ -145,51 +149,84 @@ impl InvertedIndex {
     /// Top-`eta1` methods by overlap score `|S(F(m)) ∩ S(query)|`, sorted by
     /// `(overlap DESC, MethodId ASC)`. Methods with zero overlap are omitted.
     pub fn search(&self, query: &FeatureBag, eta1: usize) -> Vec<(MethodId, u32)> {
-        self.search_bounded(query, eta1).into_iter().map(|h| (h.id, h.overlap)).collect()
+        self.search_where(query, eta1, |_| true)
+    }
+
+    /// [`search`](Self::search) restricted to methods for which `keep` holds; the
+    /// filter runs *before* the top-`eta1` cut, so rejected methods never take a slot.
+    pub fn search_where(&self, query: &FeatureBag, eta1: usize, keep: impl Fn(MethodId) -> bool) -> Vec<(MethodId, u32)> {
+        self.search_bounded_where(query, eta1, keep).into_iter().map(|h| (h.id, h.overlap)).collect()
     }
 
     /// [`search`](Self::search), with each hit's multiset upper bound [`Hit::bound`].
     pub fn search_bounded(&self, query: &FeatureBag, eta1: usize) -> Vec<Hit> {
+        self.search_bounded_where(query, eta1, |_| true)
+    }
+
+    /// [`search_bounded`](Self::search_bounded) restricted to methods for which
+    /// `keep` holds (applied before the top-`eta1` cut).
+    pub fn search_bounded_where(&self, query: &FeatureBag, eta1: usize, keep: impl Fn(MethodId) -> bool) -> Vec<Hit> {
         if eta1 == 0 || query.is_empty() || self.num_methods == 0 {
             return Vec::new();
         }
         let n = self.num_methods as usize;
-        let mut overlap = vec![0u16; n];
-        let mut bound = vec![0u32; n];
-        let has_counts = self.counts.len() == self.postings.len();
+        // `u32` accumulators: a query can share more than `u16::MAX` features.
+        let mut overlap = vec![0u32; n];
+        let mut bound = vec![0u64; n];
         for &(fid, qc) in query.entries() {
             let Some(range) = self.range_of(fid) else { continue };
-            let posts = &self.postings[range.clone()];
-            if has_counts {
-                for (&m, &c) in posts.iter().zip(&self.counts[range]) {
-                    let m = m as usize;
-                    overlap[m] = overlap[m].saturating_add(1);
-                    let add = if c == COUNT_SAT { qc } else { qc.min(u32::from(c)) };
-                    bound[m] = bound[m].saturating_add(add);
-                }
-            } else {
-                for &m in posts {
-                    let m = m as usize;
-                    overlap[m] = overlap[m].saturating_add(1);
-                    bound[m] = bound[m].saturating_add(qc);
-                }
+            for (&m, &c) in self.postings[range.clone()].iter().zip(&self.counts[range]) {
+                let m = m as usize;
+                overlap[m] += 1;
+                let add = if c == COUNT_SAT { qc } else { qc.min(u32::from(c)) };
+                bound[m] += u64::from(add);
             }
         }
-        let mut hits: Vec<(u32, u16)> = overlap
+        let mut hits: Vec<(u32, u32)> = overlap
             .iter()
             .enumerate()
-            .filter(|&(_, &c)| c > 0)
+            .filter(|&(m, &c)| c > 0 && keep(MethodId(m as u32)))
             .map(|(m, &c)| (m as u32, c))
             .collect();
-        let cmp = |a: &(u32, u16), b: &(u32, u16)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
+        let cmp = |a: &(u32, u32), b: &(u32, u32)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
         if hits.len() > eta1 {
             hits.select_nth_unstable_by(eta1, cmp);
             hits.truncate(eta1);
         }
         hits.sort_unstable_by(cmp);
-        hits.into_iter()
-            .map(|(m, c)| Hit { id: MethodId(m), overlap: u32::from(c), bound: u64::from(bound[m as usize]) })
-            .collect()
+        hits.into_iter().map(|(m, c)| Hit { id: MethodId(m), overlap: c, bound: bound[m as usize] }).collect()
+    }
+
+    /// Checks every invariant [`search_bounded`](Self::search_bounded) relies on,
+    /// for an index loaded from disk over a corpus of `expected_methods` methods.
+    pub fn validate(&self, expected_methods: usize) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        ensure!(
+            self.num_methods as usize == expected_methods,
+            "index covers {} methods but the corpus has {expected_methods}",
+            self.num_methods
+        );
+        ensure!(
+            self.offsets.len() == self.feature_ids.len() + 1,
+            "{} offsets for {} features",
+            self.offsets.len(),
+            self.feature_ids.len()
+        );
+        ensure!(self.offsets[0] == 0, "first offset is {}, not 0", self.offsets[0]);
+        ensure!(self.offsets.windows(2).all(|w| w[0] <= w[1]), "offsets are not non-decreasing");
+        let last = *self.offsets.last().expect("non-empty") as usize;
+        ensure!(last == self.postings.len(), "last offset {last} != {} postings", self.postings.len());
+        ensure!(
+            self.counts.len() == self.postings.len(),
+            "{} counts for {} postings",
+            self.counts.len(),
+            self.postings.len()
+        );
+        ensure!(self.feature_ids.windows(2).all(|w| w[0] < w[1]), "feature ids are not strictly increasing");
+        if let Some(&bad) = self.postings.iter().find(|&&m| m >= self.num_methods) {
+            anyhow::bail!("posting {bad} is out of range (num_methods = {})", self.num_methods);
+        }
+        Ok(())
     }
 
     fn range_of(&self, fid: FeatureId) -> Option<std::ops::Range<usize>> {
@@ -213,4 +250,68 @@ impl InvertedIndex {
 /// `F(t)` as sorted `(feature, count)` pairs.
 pub(crate) fn feature_bag(tree: &SimplifiedTree, featurizer: &dyn Featurizer) -> Bag {
     featurizer.featurize(tree).total().entries().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> InvertedIndex {
+        let bags = vec![
+            (MethodId(0), vec![(1, 1), (2, 3)]),
+            (MethodId(1), vec![(2, 1), (5, 300)]),
+            (MethodId(2), vec![(1, 2)]),
+        ];
+        InvertedIndex::from_bags(bags, 3)
+    }
+
+    /// Stage 5: `validate` rejects every inconsistency that would make
+    /// `search_bounded` index out of bounds.
+    #[test]
+    fn validate_catches_inconsistent_csr() {
+        let good = sample();
+        good.validate(3).unwrap();
+        assert!(good.validate(4).is_err());
+
+        let mut x = good.clone();
+        x.offsets.swap(1, 2);
+        assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        x.offsets.pop();
+        assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        *x.offsets.last_mut().unwrap() += 1;
+        assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        x.counts.pop();
+        assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        x.postings[0] = 3;
+        assert!(x.validate(3).is_err());
+        let mut x = good.clone();
+        x.feature_ids.swap(0, 1);
+        assert!(x.validate(3).is_err());
+        let mut x = good;
+        x.offsets[0] = 1;
+        assert!(x.validate(3).is_err());
+    }
+
+    /// Stage 5: overlaps are `u32` (no `u16` cap) and `search_*_where` filters
+    /// before the top-η1 cut.
+    #[test]
+    fn wide_overlaps_and_filtered_search() {
+        let n = 70_000u64;
+        let big: Vec<(FeatureId, u32)> = (0..n).map(|f| (f, 1)).collect();
+        let idx = InvertedIndex::from_bags(vec![(MethodId(0), big.clone()), (MethodId(1), big[..10].to_vec())], 2);
+        let q = FeatureBag::from_weighted(big);
+        let hits = idx.search_bounded(&q, 1);
+        assert_eq!(hits[0].overlap, n as u32);
+        assert_eq!(hits[0].bound, n);
+        assert_eq!(idx.search_where(&q, 1, |id| id != MethodId(0)), [(MethodId(1), 10)]);
+
+        let s = sample();
+        let q = FeatureBag::from_unsorted([1, 2]);
+        assert_eq!(s.search(&q, 1), [(MethodId(0), 2)]);
+        assert_eq!(s.search_where(&q, 1, |id| id.0 != 0), [(MethodId(1), 1)]);
+    }
 }

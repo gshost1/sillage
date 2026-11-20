@@ -208,7 +208,7 @@ fn save_load_preserves_results() {
     let corpus = dir.path().join("corpus");
     write_paper_corpus(&corpus);
     let a = engine_for(&corpus, &[Lang::Java], &dir.path().join("a.sil"));
-    let corpus_mem = sillage_index::build_corpus(&corpus, &[Lang::Java]);
+    let (corpus_mem, _) = sillage_index::build_corpus(&corpus, &[Lang::Java]).unwrap();
     let inv = sillage_index::InvertedIndex::build(&corpus_mem, &AromaFeaturizer);
     let bm25 = sillage_index::Bm25::build(&corpus_mem);
     let b = sillage_engine::Engine::new(corpus_mem, inv, bm25, Box::new(AromaFeaturizer), Default::default());
@@ -220,7 +220,10 @@ fn save_load_preserves_results() {
         assert_eq!(x.tree, y.tree);
         assert_eq!(x.query_match, y.query_match);
     }
-    assert_eq!(a.bm25_search("getChildAt innerView", 3), b.bm25_search("getChildAt innerView", 3));
+    assert_eq!(
+        a.bm25_search(Lang::Java, "getChildAt innerView", 3),
+        b.bm25_search(Lang::Java, "getChildAt innerView", 3)
+    );
 }
 
 /// Mini real-code corpora for every language: two functions that extend the
@@ -572,8 +575,8 @@ fn single_pass_index_and_bounded_rerank_are_exact() {
         corpora.push((vec![case.lang], corpus, vec![case.query]));
     }
     for (langs, root, queries) in corpora {
-        let (c1, i1) = sillage_index::build_corpus_and_index(&root, &langs, &AromaFeaturizer);
-        let c2 = sillage_index::build_corpus(&root, &langs);
+        let (c1, i1, _) = sillage_index::build_corpus_and_index(&root, &langs, &AromaFeaturizer).unwrap();
+        let (c2, _) = sillage_index::build_corpus(&root, &langs).unwrap();
         let i2 = sillage_index::InvertedIndex::build(&c2, &AromaFeaturizer);
         assert_eq!(c1.methods, c2.methods, "{langs:?}");
         assert_eq!(i1, i2, "{langs:?}");
@@ -609,4 +612,86 @@ fn comments_render_verbatim_and_drops_use_placeholders() {
     let pruned = t.retain(&keep);
     let out = render(&pruned, &vec![true; pruned.leaves.len()], None, Style::Plain);
     assert!(out.contains("// ...") && !out.contains("entry"), "{out}");
+}
+
+/// Stage 5 regression: one index holding Java, Python and JavaScript only ever
+/// answers a query with methods (and clusters) of the query's language, even
+/// when other languages share many of its tokens and η1 is tiny.
+#[test]
+fn mixed_language_index_stays_in_language() {
+    let dir = scratch("mixed");
+    let corpus = dir.path().join("corpus");
+    for case in CASES.iter().filter(|c| matches!(c.lang, Lang::Java | Lang::Python | Lang::JavaScript)) {
+        write(&corpus, &format!("{}-a/src/a.{}", case.lang, case.ext), case.a);
+        write(&corpus, &format!("{}-b/src/b.{}", case.lang, case.ext), case.b);
+        write(&corpus, &format!("{}-c/src/c.{}", case.lang, case.ext), case.distractor);
+    }
+    // Look-alikes in other languages sharing the Python query's identifiers.
+    write(
+        &corpus,
+        "lookalike-java/src/L.java",
+        "class L {\n    Object open(String path) {\n        Object fh = open(path);\n        Object data = json.load(fh);\n        return data;\n    }\n}\n",
+    );
+    write(
+        &corpus,
+        "lookalike-js/src/l.js",
+        "function openIt(path) {\n  const fh = open(path);\n  const data = json.load(fh);\n  return data;\n}\n",
+    );
+    let langs = [Lang::Java, Lang::Python, Lang::JavaScript];
+    let mut engine = engine_for(&corpus, &langs, &dir.path().join("mixed.sil"));
+    let lang_of = |e: &sillage_engine::Engine, id: sillage_core::MethodId| e.corpus.methods[id.0 as usize].lang;
+    let all_langs: std::collections::BTreeSet<Lang> = engine.corpus.methods.iter().map(|m| m.lang).collect();
+    assert_eq!(all_langs.len(), 3);
+
+    for eta1 in [2, 3, 1000] {
+        engine.params.eta1 = eta1;
+        for case in CASES.iter().filter(|c| matches!(c.lang, Lang::Java | Lang::Python | Lang::JavaScript)) {
+            let lang = case.lang;
+            let ranked = engine.search(lang, case.query, 100).unwrap();
+            assert!(!ranked.is_empty(), "{lang} eta1={eta1}");
+            assert!(ranked.iter().all(|r| lang_of(&engine, r.id) == lang), "{lang} eta1={eta1}: cross-language result");
+            let ex = engine.search_exhaustive(lang, case.query, 100).unwrap();
+            assert!(ex.iter().all(|r| lang_of(&engine, r.id) == lang));
+            let feats = engine.features_only(lang, case.query, 100).unwrap();
+            assert!(feats.iter().all(|&id| lang_of(&engine, id) == lang));
+            let bm25 = engine.bm25_search(lang, case.query, 100);
+            assert!(bm25.iter().all(|&id| lang_of(&engine, id) == lang));
+            let out = engine.recommend(lang, case.query).unwrap();
+            assert!(out.n2.iter().all(|r| lang_of(&engine, r.id) == lang));
+            for rec in &out.recommendations {
+                assert!(rec.cluster.iter().all(|&id| lang_of(&engine, id) == lang), "{lang}: mixed cluster");
+            }
+            if eta1 == 1000 {
+                // η1 slots are not wasted: the two same-language look-alikes reach N2.
+                assert!(out.n2.len() >= 2, "{lang}: n2 = {}", out.n2.len());
+                assert!(out.recommendations.iter().any(|r| r.cluster.len() >= 2), "{lang}: no multi-method cluster");
+            }
+        }
+    }
+    // With η1 = 2, the Python query's top Phase I slots are both Python methods.
+    engine.params.eta1 = 2;
+    let py = CASES.iter().find(|c| c.lang == Lang::Python).unwrap();
+    let out = engine.recommend(Lang::Python, py.query).unwrap();
+    assert_eq!(out.n2.len(), 2, "both η1 slots go to Python methods");
+}
+
+/// Stage 5 regression: `recommend_excluding` drops the excluded methods before
+/// Phase II, so they occupy no N2, cluster or top-k slot.
+#[test]
+fn recommend_excluding_drops_methods_before_phase_two() {
+    let dir = scratch("exclude");
+    let corpus = dir.path().join("corpus");
+    write_paper_corpus(&corpus);
+    let mut engine = engine_for(&corpus, &[Lang::Java], &dir.path().join("x.sil"));
+    let full = engine.recommend(Lang::Java, LISTING4).unwrap();
+    let top = full.n2[0].id;
+    let out = engine.recommend_excluding(Lang::Java, LISTING4, &[top]).unwrap();
+    assert!(out.n2.iter().all(|r| r.id != top));
+    assert!(out.recommendations.iter().all(|r| !r.cluster.contains(&top)));
+    // The freed slot is reused: with η1 = |N2 of the full run|, the excluded
+    // method does not cost the excluded run a candidate.
+    engine.params.eta1 = full.n2.len().max(1);
+    let narrow = engine.recommend_excluding(Lang::Java, LISTING4, &[top]).unwrap();
+    assert!(narrow.n2.iter().all(|r| r.id != top));
+    assert_eq!(engine.recommend_excluding(Lang::Java, LISTING4, &[]).unwrap().n2.len(), engine.recommend(Lang::Java, LISTING4).unwrap().n2.len());
 }

@@ -71,6 +71,7 @@ fn main() -> anyhow::Result<()> {
         .map(|q| {
             // Keep only (id, sim, overlap): full `Ranked` values hold two trees
             // each, and 1000 queries x 100 of them need several GB.
+            let total = engine.query_features(q.lang, &q.snippet).map(|f| f.total()).unwrap_or(0);
             let ranked: Vec<Hit> = engine
                 .search(q.lang, &q.snippet, 100)
                 .unwrap_or_default()
@@ -78,10 +79,10 @@ fn main() -> anyhow::Result<()> {
                 .map(|r| Hit { id: r.id, sim: r.sim, overlap: r.overlap })
                 .collect();
             let pairs: Vec<(MethodId, u64)> = ranked.iter().map(|r| (r.id, r.sim)).collect();
-            (ranked_hits(q.orig, &pairs), ranked)
+            (ranked_hits(q.orig, &pairs, total), ranked)
         })
         .collect();
-    let misses: Vec<usize> = (0..queries.len()).filter(|&i| !results[i].0.0).collect();
+    let misses: Vec<usize> = (0..queries.len()).filter(|&i| !results[i].0.r1).collect();
     let mut hist = [0usize; 5]; // rank 2, 3-5, 6-10, 11-100, absent
     for &i in &misses {
         let pos = results[i].1.iter().position(|r| r.id == queries[i].orig);

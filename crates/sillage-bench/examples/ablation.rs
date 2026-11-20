@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
     let show_misses = args.get(5).is_some_and(|s| s == "misses");
 
     let t = Instant::now();
-    let corpus = sillage_index::build_corpus(&corpus_dir, &[lang]);
+    let (corpus, _) = sillage_index::build_corpus(&corpus_dir, &[lang])?;
     eprintln!("corpus: {} methods in {:.1}s", corpus.methods.len(), t.elapsed().as_secs_f64());
 
     let variants: Vec<(&str, Box<dyn Featurizer>)> =
@@ -50,10 +50,10 @@ fn main() -> anyhow::Result<()> {
         let cfg = RecallCfg { n, mode, bootstrap: 1000, seed };
         let queries = build_queries(&engine, &cfg);
         let t = Instant::now();
-        let per: Vec<[(bool, bool); 3]> = queries.par_iter().map(|q| evaluate_query(&engine, q)).collect();
+        let per: Vec<[sillage_bench::recall::Hits; 3]> = queries.par_iter().map(|q| evaluate_query(&engine, q)).collect();
         eprintln!("{name}: {} queries in {:.1}s", queries.len(), t.elapsed().as_secs_f64());
         let pct = |sys: usize, at1: bool| {
-            let h: Vec<bool> = per.iter().map(|r| if at1 { r[sys].0 } else { r[sys].1 }).collect();
+            let h: Vec<bool> = per.iter().map(|r| if at1 { r[sys].r1 } else { r[sys].r100 }).collect();
             format!("{:.1}%", 100.0 * bootstrap_hits(&h, 1000, seed).mean)
         };
         println!(
@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
         );
         if show_misses && k == 0 {
             for (q, r) in queries.iter().zip(&per) {
-                if r[2].0 {
+                if r[2].r1 {
                     continue;
                 }
                 let ranked = engine.search(q.lang, &q.snippet, 100)?;
