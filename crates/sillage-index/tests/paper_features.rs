@@ -121,3 +121,30 @@ fn out_of_range_leaf_is_empty() {
     let tree = listing4();
     assert!(feature_debug(&tree, tree.leaves.len()).is_empty());
 }
+
+/// Stage 3 query mode: sibling and variable-usage features only link leaves on
+/// the same line, and no parent feature names a statement-sequence root;
+/// methods keep every feature.
+#[test]
+fn query_mode_drops_cross_line_relations() {
+    use sillage_core::Lang;
+    use sillage_index::query_feature_debug;
+    let tree = sillage_parse::parse_snippet(Lang::Java, "int n = count(4);\nverify(n);").unwrap();
+    let all = |f: fn(&sillage_core::SimplifiedTree, usize) -> Vec<String>| -> Vec<String> {
+        (0..tree.leaves.len()).flat_map(|i| f(&tree, i)).collect()
+    };
+    let (full, query) = (all(feature_debug), all(query_feature_debug));
+    // Cross-line sibling `(4, verify)` and the usage pair of `n` across lines.
+    assert!(full.iter().any(|f| f == "(4, verify)"), "{full:?}");
+    assert!(!query.iter().any(|f| f == "(4, verify)"), "{query:?}");
+    let usage = |fs: &[String]| fs.iter().filter(|f| f.starts_with("((")).count();
+    assert!(usage(&full) > 0 && usage(&query) == 0, "{full:?}\n{query:?}");
+    // Same-line siblings stay; root `{#}` parents go.
+    assert!(query.iter().any(|f| f == "(count, 4)"), "{query:?}");
+    assert!(full.iter().any(|f| f.ends_with(", 0, {#})")));
+    assert!(!query.iter().any(|f| f.ends_with(", 0, {#})")), "{query:?}");
+    // The trait method agrees with the debug view.
+    let q = AromaFeaturizer.featurize_query(&tree).total().total();
+    assert_eq!(q, query.len() as u64);
+    assert!(AromaFeaturizer.featurize(&tree).total().total() > q);
+}

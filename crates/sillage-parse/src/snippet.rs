@@ -12,7 +12,7 @@ use sillage_core::{Lang, Node as SNode, NodeId, SimplifiedTree, Span};
 use tree_sitter::{Node, Tree};
 
 use crate::lang::tables;
-use crate::lower::{Lowerer, Mapping, build};
+use crate::lower::{HOLE, Lowerer, Mapping, build};
 use crate::{parse_ts, scope};
 
 pub(crate) struct Wrapped {
@@ -47,6 +47,34 @@ impl Wrapped {
         w.text.push_str(suffix);
         w.map = w.map.with_phantom(start, end);
         w
+    }
+
+    /// `prefix + s + suffix` with a [`HOLE`] inserted at each offset of `holes`
+    /// (sorted) and, when non-empty, `closers` appended as phantom tokens.
+    fn with_holes(prefix: &str, s: &str, holes: &[usize], closers: &str, suffix: &str) -> Self {
+        let mut text = String::with_capacity(prefix.len() + s.len() + holes.len() * HOLE.len() + closers.len() + suffix.len() + 1);
+        text.push_str(prefix);
+        let (mut segs, mut ranges) = (Vec::new(), Vec::new());
+        let mut last = 0usize;
+        for &h in holes {
+            segs.push((text.len() as u32, last as u32, (h - last) as u32));
+            text.push_str(&s[last..h]);
+            let start = text.len() as u32;
+            text.push_str(HOLE);
+            ranges.push((start, text.len() as u32));
+            last = h;
+        }
+        segs.push((text.len() as u32, last as u32, (s.len() - last) as u32));
+        text.push_str(&s[last..]);
+        let mut map = Mapping::new(segs).with_holes(ranges);
+        if !closers.is_empty() {
+            text.push('\n');
+            let start = text.len() as u32;
+            text.push_str(closers);
+            map = map.with_phantom(start, text.len() as u32);
+        }
+        text.push_str(suffix);
+        Self { text, map }
     }
 
     fn python_block_closed(s: &str, closers: &str) -> Self {
@@ -292,6 +320,8 @@ pub(crate) fn parse_snippet(lang: Lang, s: &str) -> Result<SimplifiedTree> {
     let pairs: &[(&str, &str)] = match lang {
         Lang::Java => &[
             ("class __S { void __m() {\n", "\n} }"),
+            // `this(…)` / `super(…)` only parse in a constructor body.
+            ("class __S { __S() {\n", "\n} }"),
             ("class __S {\n", "\n}"),
             ("", ""),
             ("class __S { Object __m() { return (\n", "\n); } }"),
@@ -314,9 +344,16 @@ pub(crate) fn parse_snippet(lang: Lang, s: &str) -> Result<SimplifiedTree> {
     // try each wrapper first with the missing closers appended (kept as zero-width
     // keywords), so the snippet's own constructs are closed by itself instead of by
     // the wrapper's braces.
+    //
+    // Missing operands get holes first (see `holes`): `x =` reads `#=#` and a
+    // leading-dot `.build();` reads `#.#()`, as in the complete code.
     let cl = closers(lang, s);
-    let mut candidates = Vec::with_capacity(pairs.len() * 2 + 2);
+    let holes = holes(lang, s);
+    let mut candidates = Vec::with_capacity(pairs.len() * 3 + 2);
     for &(prefix, suffix) in pairs {
+        if !holes.is_empty() {
+            candidates.push(Wrapped::with_holes(prefix, s, &holes, &cl, suffix));
+        }
         if !cl.is_empty() {
             candidates.push(Wrapped::closed(prefix, s, &cl, suffix));
         }
@@ -334,19 +371,91 @@ pub(crate) fn parse_snippet(lang: Lang, s: &str) -> Result<SimplifiedTree> {
 /// Closers for the brackets `s` leaves open, innermost first (e.g. `)}` for
 /// `if (x) {\n  foo(a,`). Strings, char literals and comments are skipped.
 pub(crate) fn closers(lang: Lang, s: &str) -> String {
+    scan(lang, s).0.iter().rev().map(|&c| c as char).collect()
+}
+
+/// Operators that leave a snippet's last expression without its right operand,
+/// longest first. `++`/`--` (complete postfix) are checked before `+`/`-`.
+///
+/// A trailing `,` is deliberately absent: `foo(a, b,` cut from a longer call
+/// would read `#(#,#,#)` with a hole (or `#(#,#)` with the comma stripped) and
+/// then match *other* methods' 3-argument (2-argument) calls exactly, while the
+/// original's call has an unknown arity. Left as is, the label `#(#,#,)` matches
+/// nothing. Measured on the Java benchmark, holes after `,` cost 0.2–0.4 points
+/// of contiguous Recall@1.
+const DANGLING: &[&str] = &[
+    ">>>=", ">>=", "<<=", "===", "!==", "**=", "&&", "||", "??", "?.", "==", "!=", "<=", ">=", "+=", "-=",
+    "*=", "/=", "%=", "&=", "|=", "^=", "->", "=>", "::", ":=", "<<", ".", "=", "+", "-", "*", "/", "%",
+    "&", "|", "^", "?", ":", "!", "~",
+];
+
+/// Offsets where a [`HOLE`] stands in for a missing operand of `s`:
+/// - after a trailing dangling operator (`x =`, `a &&`, `obj.`), ignoring
+///   trailing comments and whitespace (not after `,`: see [`DANGLING`]);
+/// - before a leading-dot member access (`.build();`) that starts the snippet or
+///   follows a line ending a statement or opening a list (`;`, `{`, `}`, `(`, `,`),
+///   i.e. a fluent-chain line whose receiver was not sampled.
+pub(crate) fn holes(lang: Lang, s: &str) -> Vec<usize> {
+    let (_, last_code, line_ends) = scan(lang, s);
     let b = s.as_bytes();
+    let mut out = Vec::new();
+    if matches!(lang, Lang::Java | Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Rust) {
+        let mut prev_end: Option<u8> = None;
+        let mut line_start = 0usize;
+        for line in s.split_inclusive('\n') {
+            let lead = line.len() - line.trim_start().len();
+            let at = line_start + lead;
+            let next = b.get(at + 1).copied().unwrap_or(b' ');
+            if b.get(at) == Some(&b'.')
+                && (next.is_ascii_alphabetic() || next == b'_' || next == b'$')
+                && prev_end.is_none_or(|c| matches!(c, b';' | b'{' | b'}' | b'(' | b','))
+            {
+                out.push(at);
+            }
+            let end = line_start + line.len();
+            if let Some(&e) = line_ends.iter().rfind(|&&e| e > line_start && e <= end) {
+                prev_end = Some(b[e - 1]);
+            }
+            line_start = end;
+        }
+    }
+    let t = &s[..last_code];
+    let dangling = !t.ends_with("++")
+        && !t.ends_with("--")
+        && DANGLING.iter().find(|op| t.ends_with(**op)).is_some_and(|&op| match op {
+            "?" => lang != Lang::Rust,  // Rust's `?` is the (complete) try operator
+            ":" => lang != Lang::Python, // a Python block header
+            "!" => lang != Lang::Rust,  // `vec!` / `println!` macro bang
+            "*" | "/" => !t.ends_with("*/"),
+            _ => true,
+        });
+    if dangling && out.last().is_none_or(|&h| h < last_code) {
+        out.push(last_code);
+    }
+    out
+}
+
+/// `(open-bracket stack, end of the last code byte, end of every code byte)` of `s`,
+/// skipping strings, char literals and comments.
+fn scan(lang: Lang, s: &str) -> (Vec<u8>, usize, Vec<usize>) {
+    let b = s.as_bytes();
+    let mut last_code = 0usize;
+    let mut code_ends: Vec<usize> = Vec::new();
     let hash_comments = lang == Lang::Python;
     let mut stack: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
+        let mut code = !c.is_ascii_whitespace();
         match c {
             b'/' if !hash_comments && b.get(i + 1) == Some(&b'/') => {
                 while i < b.len() && b[i] != b'\n' {
                     i += 1;
                 }
+                continue;
             }
             b'/' if !hash_comments && b.get(i + 1) == Some(&b'*') => {
+                code = false;
                 i += 2;
                 while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
                     i += 1;
@@ -357,6 +466,7 @@ pub(crate) fn closers(lang: Lang, s: &str) -> String {
                 while i < b.len() && b[i] != b'\n' {
                     i += 1;
                 }
+                continue;
             }
             b'"' | b'`' => {
                 let q = c;
@@ -395,9 +505,13 @@ pub(crate) fn closers(lang: Lang, s: &str) -> String {
             }
             _ => {}
         }
+        if code {
+            last_code = (i + 1).min(b.len());
+            code_ends.push(last_code);
+        }
         i += 1;
     }
-    stack.iter().rev().map(|&c| c as char).collect()
+    (stack, last_code, code_ends)
 }
 
 #[cfg(test)]

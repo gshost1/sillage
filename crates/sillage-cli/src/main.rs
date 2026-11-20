@@ -432,7 +432,7 @@ fn cmd_explain(input: &SnippetInput) -> anyhow::Result<()> {
     out.push_str("\n# per-leaf features\n");
     for (i, &leaf) in tree.leaves.iter().enumerate() {
         out.push_str(&format!("leaf {i} {:?}\n", tree.label(leaf)));
-        for f in sillage_index::feature_debug(&tree, i) {
+        for f in sillage_index::query_feature_debug(&tree, i) {
             out.push_str(&format!("    {f}\n"));
         }
     }

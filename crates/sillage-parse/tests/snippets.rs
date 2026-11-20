@@ -90,3 +90,81 @@ fn snippet_kinds_parse_cleanly() {
         assert!(common::tokens(&t).iter().all(|(s, _)| !s.starts_with("__")));
     }
 }
+
+/// Label of the root, with every hole (internal node labelled "") shown as `#`.
+fn root_label(t: &SimplifiedTree) -> String {
+    t.label(0).to_string()
+}
+
+fn has_hole(t: &SimplifiedTree) -> bool {
+    common::labels(t).iter().any(|l| l.is_empty())
+}
+
+/// Stage 3: a dangling operator gets a featureless hole, so the expression reads
+/// like the complete code (`#=#`, `#&&#`, `#.#`), with no placeholder token.
+#[test]
+fn dangling_operators_get_holes() {
+    let cases: &[(Lang, &str, &str)] = &[
+        (Lang::Java, "x =", "#=#"),
+        (Lang::Java, "int y = a &&", "int#;"),
+        (Lang::Java, "foo.", "#.#"),
+        (Lang::JavaScript, "const z = a ||", "const#"),
+        (Lang::Python, "total = a +", "#=#"),
+        (Lang::Go, "v :=", "#:=#"),
+    ];
+    for (lang, s, root) in cases {
+        let t = snippet(*lang, s);
+        assert!(has_hole(&t), "{lang} {s:?}:\n{}", common::dump(&t));
+        if !root.is_empty() {
+            assert_eq!(&root_label(&t), root, "{lang} {s:?}:\n{}", common::dump(&t));
+        }
+        assert!(common::tokens(&t).iter().all(|(s, _)| !s.contains("sillage_hole")));
+    }
+    // `a &&` is a two-operand `&&`.
+    let t = snippet(Lang::Java, "boolean b = a &&");
+    assert!(common::labels(&t).iter().any(|l| l == "#&&#"), "{}", common::dump(&t));
+}
+
+/// A trailing `,` is left alone (no hole): the call's arity is unknown.
+#[test]
+fn trailing_comma_gets_no_hole() {
+    let t = snippet(Lang::Java, "foo(a, b,");
+    assert!(!has_hole(&t), "{}", common::dump(&t));
+    // Complete postfix operators and Rust's `?` are not dangling.
+    for (lang, s) in [(Lang::Java, "i++"), (Lang::Rust, "let v = f()?"), (Lang::Python, "if x:\n    y = 1")] {
+        assert!(!has_hole(&snippet(lang, s)), "{lang} {s:?}");
+    }
+}
+
+/// A leading-dot fluent-chain line whose receiver was not sampled reads
+/// `#.#` with a hole receiver, like `x.build()` in the method; a chain continued
+/// from the previous line keeps its real receiver.
+#[test]
+fn leading_dot_lines_get_hole_receivers() {
+    let t = snippet(Lang::Java, "        .build();");
+    assert_eq!(root_label(&t), "#;", "{}", common::dump(&t));
+    assert!(has_hole(&t));
+    assert!(common::labels(&t).iter().any(|l| l == "#.#"));
+    // Continued chain: no hole.
+    let t = snippet(Lang::Java, "Foo f = new Foo.Builder()\n    .setX(1)\n    .build();");
+    assert!(!has_hole(&t), "{}", common::dump(&t));
+    // After a complete statement: hole.
+    let t = snippet(Lang::Java, "a();\n    .build();");
+    assert!(has_hole(&t), "{}", common::dump(&t));
+    let t = snippet(Lang::TypeScript, "await x;\n  .then((r) => r.json());");
+    assert!(has_hole(&t), "{}", common::dump(&t));
+}
+
+/// `this(…)` / `super(…)` parse error-free inside a constructor wrapper, with
+/// the same shape as in a corpus constructor body.
+#[test]
+fn explicit_constructor_calls_parse_in_constructor_wrapper() {
+    let t = snippet(Lang::Java, "this(uri, 0);");
+    assert_eq!(root_label(&t), "this(#,#);", "{}", common::dump(&t));
+    let t = snippet(Lang::Java, "super(src.type);\nname = src.name;");
+    assert!(common::labels(&t).iter().any(|l| l == "super(#);"), "{}", common::dump(&t));
+    let m = "class A { A(B src) { super(src.type);\nname = src.name; } }";
+    let ex = &sillage_parse::extract_methods(Lang::Java, m)[0];
+    let body = parse_method(Lang::Java, &m[ex.text_span.start as usize..ex.text_span.end as usize], ex.body_span).unwrap();
+    assert!(common::labels(&body).iter().any(|l| l == "super(#);"), "{}", common::dump(&body));
+}

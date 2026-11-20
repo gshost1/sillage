@@ -25,7 +25,7 @@ impl Engine {
 
     fn query_features(&self, lang: Lang, snippet: &str) -> anyhow::Result<FeatureBag> {
         let tree = sillage_parse::parse_snippet(lang, snippet)?;
-        Ok(self.featurizer.featurize(&tree).total())
+        Ok(self.featurizer.featurize_query(&tree).total())
     }
 
     /// Re-parses a Phase I candidate (methods that fail to parse are skipped).

@@ -29,11 +29,30 @@ pub(crate) struct Mapping {
     /// Wrapped `[start, end)` of synthesized closers (`)`, `]`, `}`) appended to an
     /// unbalanced snippet: their keywords are kept with a zero-width span.
     phantom: Option<(u32, u32)>,
+    /// Wrapped `[start, end)` ranges of inserted *hole* placeholders (see
+    /// [`HOLE`]), sorted.
+    holes: Vec<(u32, u32)>,
 }
+
+/// Placeholder identifier inserted where a partial snippet is missing an operand
+/// (`x =`, `a &&`, `foo(a,`, a leading-dot `.build()`). It lowers to a featureless
+/// hole node, which reads `#` in its parent's label (so `x = ⟨hole⟩` is `#=#`, as
+/// in the complete code) but adds no token, parent, sibling or usage feature.
+pub(crate) const HOLE: &str = "__sillage_hole";
 
 impl Mapping {
     pub(crate) fn new(segs: Vec<(u32, u32, u32)>) -> Self {
-        Self { segs, phantom: None }
+        Self { segs, phantom: None, holes: Vec::new() }
+    }
+
+    pub(crate) fn with_holes(mut self, holes: Vec<(u32, u32)>) -> Self {
+        self.holes = holes;
+        self
+    }
+
+    fn in_hole(&self, ws: usize) -> bool {
+        let ws = ws as u32;
+        self.holes.iter().any(|&(s, e)| (s..e).contains(&ws))
     }
 
     pub(crate) fn with_phantom(mut self, start: u32, end: u32) -> Self {
@@ -114,7 +133,22 @@ impl Lowerer<'_> {
         })
     }
 
+    /// A hole: an internal node with one empty zero-width keyword. It counts as
+    /// `#` in its parent's label and carries no features (it has no `Token`).
+    fn hole(&self, node: Node<'_>) -> Draft {
+        let at = self.map.clamp(node.start_byte());
+        let span = Span::new(at, at);
+        Draft {
+            kind: NodeKind::Internal { label: "".into() },
+            span,
+            children: vec![Draft { kind: NodeKind::Keyword { text: "".into() }, span, children: Vec::new() }],
+        }
+    }
+
     fn leaf(&self, node: Node<'_>, keyword: bool) -> Option<Draft> {
+        if node.is_named() && self.map.in_hole(node.start_byte()) {
+            return Some(self.hole(node));
+        }
         let Some(span) = self.map.map(node.start_byte(), node.end_byte()) else {
             if keyword && !node.is_named() && self.map.in_phantom(node.start_byte()) {
                 return self.phantom(node);

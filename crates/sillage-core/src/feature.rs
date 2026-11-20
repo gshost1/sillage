@@ -229,6 +229,13 @@ impl LeafFeatures {
 
 pub trait Featurizer: Send + Sync {
     fn featurize(&self, tree: &SimplifiedTree) -> LeafFeatures;
+
+    /// Features of a partial query snippet (`F(q)`). Defaults to
+    /// [`featurize`](Self::featurize); a featurizer may drop features that a
+    /// snippet cannot share with the method it was taken from.
+    fn featurize_query(&self, tree: &SimplifiedTree) -> LeafFeatures {
+        self.featurize(tree)
+    }
 }
 
 #[cfg(test)]

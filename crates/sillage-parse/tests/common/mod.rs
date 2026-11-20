@@ -53,9 +53,16 @@ pub fn check_spans(t: &SimplifiedTree) {
     for n in &t.nodes {
         let s = &t.source[n.span.start as usize..n.span.end as usize];
         match &n.kind {
-            // Zero-width keywords are synthesized closers / MISSING tokens.
+            // Zero-width keywords are synthesized closers / MISSING tokens, or the
+            // empty keyword of a hole (an internal node labelled "" with that
+            // keyword as its only child).
             NodeKind::Keyword { text } if n.span.is_empty() => {
-                assert!(matches!(text.as_ref(), ")" | "]" | "}") || !text.trim().is_empty(), "{text:?}")
+                let hole = text.is_empty()
+                    && n.parent.is_some_and(|p| {
+                        let p = t.node(p);
+                        matches!(&p.kind, NodeKind::Internal { label } if label.is_empty()) && p.children.len() == 1
+                    });
+                assert!(hole || matches!(text.as_ref(), ")" | "]" | "}") || !text.trim().is_empty(), "{text:?}")
             }
             NodeKind::Keyword { text } | NodeKind::Token { text, .. } => {
                 assert_eq!(s, text.as_ref(), "span text mismatch")

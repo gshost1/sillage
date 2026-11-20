@@ -7,3 +7,6 @@
 cc 912d1bf1cb0449f4e5d5515f4b942010ec33944225dbc69421732bfa9a1c0e99 # shrinks to lang_idx = 0, s = "𞸅¡a#𑁒ⴭ"
 cc 897626411b9fcfa946742eaf540d7207d827d751a5d5b4c6b3c96d3cbc86b305 # shrinks to idx = 425, start = 73, len = 1
 cc de9da87b2a04602a44494718634d0b210c4c0462cc4ddc5613ad4693a1cae858 # shrinks to idx = 711, a = 2054, b = 12
+cc 77b26d34b2fa4b76f65612e9d0c8e5481545a4747a40f153a94aef95c515aa69 # shrinks to lang_idx = 6, s = ".$ᤀ&🌀𑈀"
+cc 002d1f872b8e57297be0c01c1ac08a2e3f6b508383c8fb6bbb7b5994d125dbf5 # shrinks to idx = 374, a = 1742, b = 2
+cc 51cab11a9dc9586fc526225192ad42cbb9bb78deed6fef5adcbf720b185f1344 # shrinks to idx = 755, start = 107, len = 2
