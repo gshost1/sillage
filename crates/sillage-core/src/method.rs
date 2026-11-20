@@ -49,6 +49,17 @@ impl Lang {
     }
 }
 
+/// Whether a query in `query` may retrieve a method in `method`: the same
+/// language, except that TypeScript and TSX share one family (a `.tsx` file is
+/// TypeScript with JSX, and both use the same grammar for method bodies).
+pub fn lang_compatible(query: Lang, method: Lang) -> bool {
+    let family = |l: Lang| match l {
+        Lang::Tsx => Lang::TypeScript,
+        l => l,
+    };
+    family(query) == family(method)
+}
+
 impl fmt::Display for Lang {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -91,4 +102,23 @@ pub struct MethodRecord {
     pub line_start: u32,
     pub text: Arc<str>,
     pub body: Span,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lang_families() {
+        assert!(lang_compatible(Lang::Java, Lang::Java));
+        assert!(lang_compatible(Lang::TypeScript, Lang::Tsx));
+        assert!(lang_compatible(Lang::Tsx, Lang::TypeScript));
+        assert!(!lang_compatible(Lang::JavaScript, Lang::TypeScript));
+        assert!(!lang_compatible(Lang::Python, Lang::Java));
+        for &a in Lang::ALL {
+            for &b in Lang::ALL {
+                assert_eq!(lang_compatible(a, b), lang_compatible(b, a));
+            }
+        }
+    }
 }

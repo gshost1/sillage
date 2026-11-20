@@ -498,9 +498,19 @@ fn scan(lang: Lang, s: &str) -> (Vec<u8>, usize, Vec<usize>) {
                 }
                 continue;
             }
-            b'"' | b'`' => {
+            b'\'' if !matches!(lang, Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Tsx) => {
+                // A char literal (`'a'`, `'\''`, `'\u{1F600}'`) — unless it is a
+                // Rust lifetime / label (`'a`), which has no closing quote.
+                if let Some(end) = char_literal_end(b, i) {
+                    i = end;
+                }
+            }
+            b'"' | b'`' | b'\'' => {
                 let q = c;
-                let triple = hash_comments && b.get(i + 1) == Some(&q) && b.get(i + 2) == Some(&q);
+                // Python `"""` / `'''` strings and Java `"""` text blocks.
+                let triple = (hash_comments || (lang == Lang::Java && q == b'"'))
+                    && b.get(i + 1) == Some(&q)
+                    && b.get(i + 2) == Some(&q);
                 i += if triple { 3 } else { 1 };
                 while i < b.len() {
                     if b[i] == b'\\' {
@@ -511,18 +521,11 @@ fn scan(lang: Lang, s: &str) -> (Vec<u8>, usize, Vec<usize>) {
                         i += if triple { 2 } else { 0 };
                         break;
                     }
-                    if b[i] == b'\n' && q == b'"' && !triple && !matches!(lang, Lang::Rust | Lang::Go) {
+                    let multiline = triple || q == b'`' || (q == b'"' && matches!(lang, Lang::Rust | Lang::Go));
+                    if b[i] == b'\n' && !multiline {
                         break; // unterminated single-line string
                     }
                     i += 1;
-                }
-            }
-            b'\'' => {
-                // A char literal / Python or JS string — unless it is a Rust lifetime.
-                let close = b[i + 1..].iter().take(if matches!(lang, Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Tsx) { usize::MAX } else { 4 }).position(|&x| x == b'\'' || x == b'\n');
-                match close {
-                    Some(k) if b[i + 1 + k] == b'\'' => i += 1 + k,
-                    _ => {}
                 }
             }
             b'(' => stack.push(b')'),
@@ -544,9 +547,74 @@ fn scan(lang: Lang, s: &str) -> (Vec<u8>, usize, Vec<usize>) {
     (stack, last_code, code_ends)
 }
 
+/// Index of the closing quote of a char literal opening at `b[i] == '\''`, or
+/// `None` when the quote opens a Rust lifetime / label instead. Escapes
+/// (`'\''`, `'\\'`, `'\u{10FFFF}'`) are skipped; an unescaped literal holds
+/// exactly one (UTF-8) character.
+fn char_literal_end(b: &[u8], i: usize) -> Option<usize> {
+    match b.get(i + 1)? {
+        b'\\' => {
+            let mut j = i + 3; // past the escaped byte
+            while j < b.len() && j <= i + 12 {
+                match b[j] {
+                    b'\'' => return Some(j),
+                    b'\n' => return None,
+                    _ => j += 1,
+                }
+            }
+            None
+        }
+        b'\'' | b'\n' => None,
+        &first => {
+            let len = match first {
+                0x00..=0x7f => 1,
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                _ => 4,
+            };
+            (b.get(i + 1 + len) == Some(&b'\'')).then_some(i + 1 + len)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stage 5: `\\` escapes inside single-quoted strings and char literals do
+    /// not end the literal, so brackets after them are still balanced.
+    #[test]
+    fn scan_handles_single_quote_escapes() {
+        // JS / Python string with an escaped quote: the `(` inside is not code.
+        let (stack, _, _) = scan(Lang::JavaScript, "f('it\\'s (', x)");
+        assert!(stack.is_empty(), "{stack:?}");
+        let (stack, _, _) = scan(Lang::Python, "f('it\\'s [', x)");
+        assert!(stack.is_empty(), "{stack:?}");
+        // Java / Rust char literals with escapes.
+        let (stack, _, _) = scan(Lang::Java, "if (c == '\\'' || c == '(') {");
+        assert_eq!(stack, b"}");
+        let (stack, _, _) = scan(Lang::Rust, "let v = ['\\\\', '\\u{1F600}', '('];");
+        assert!(stack.is_empty(), "{stack:?}");
+        // A Rust lifetime is not a literal: the `(` after it is code.
+        let (stack, _, _) = scan(Lang::Rust, "fn f<'a>(x: &'a str");
+        assert_eq!(stack, b")");
+        assert_eq!(char_literal_end(b"'\\u{10FFFF}'", 0), Some(11));
+        assert_eq!(char_literal_end("'é'".as_bytes(), 0), Some(3));
+        assert_eq!(char_literal_end(b"'a>", 0), None);
+    }
+
+    /// Stage 5: a Java `"""` text block is one string literal, even with
+    /// brackets and lone quotes on its interior lines.
+    #[test]
+    fn scan_treats_java_text_blocks_as_one_literal() {
+        let src = "String s = \"\"\"\n    { \"(\" [\n    \"\"\";\nuse(s);";
+        let (stack, last, _) = scan(Lang::Java, src);
+        assert!(stack.is_empty(), "{stack:?}");
+        assert_eq!(last, src.len());
+        let open = "String s = \"\"\"\n    { (\n";
+        let (stack, _, _) = scan(Lang::Java, open);
+        assert!(stack.is_empty(), "unterminated text block swallows the rest: {stack:?}");
+    }
 
     /// The preorder range move equals a deep copy of the body subtree, for
     /// methods in every language (incl. nested functions and lambdas).
