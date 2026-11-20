@@ -53,7 +53,7 @@ pub struct QualityCfg {
     pub seed: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QualityReport {
     pub sampled: usize,
     pub containment_rate: f64,
@@ -69,6 +69,48 @@ pub struct QualityReport {
     /// Per-phase latency percentiles (`parse`, `phase1`, `phase2`, `phase3`).
     #[serde(default)]
     pub phases: Vec<PhaseLatency>,
+    /// Kept recommendations by cluster size.
+    #[serde(default)]
+    pub cluster_sizes: ClusterSizes,
+    /// Share of queries with at least one kept multi-method cluster.
+    #[serde(default)]
+    pub multi_cluster_rate: f64,
+    /// Share of queries with a recommendation whose every added (rendered,
+    /// non-placeholder) line occurs verbatim, whitespace-normalized, in the
+    /// held-out half: an automated proxy for §4.2's "exact recommendation".
+    #[serde(default)]
+    pub exact_match_rate: f64,
+    /// Best recommendation per query (by line F1): share of its added lines that
+    /// occur in the held-out half, averaged over queries with recommendations.
+    #[serde(default)]
+    pub avg_line_precision: f64,
+    /// Same recommendation: share of held-out lines it reproduces.
+    #[serde(default)]
+    pub avg_line_recall: f64,
+}
+
+/// Histogram of cluster sizes `|cluster|` over kept recommendations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterSizes {
+    pub singleton: usize,
+    pub two: usize,
+    pub three_to_five: usize,
+    pub six_plus: usize,
+}
+
+impl ClusterSizes {
+    pub fn add(&mut self, size: usize) {
+        match size {
+            0 | 1 => self.singleton += 1,
+            2 => self.two += 1,
+            3..=5 => self.three_to_five += 1,
+            _ => self.six_plus += 1,
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        self.singleton + self.two + self.three_to_five + self.six_plus
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

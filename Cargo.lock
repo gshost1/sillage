@@ -863,6 +863,7 @@ dependencies = [
  "sillage-engine",
  "sillage-index",
  "sillage-parse",
+ "sillage-render",
  "toml",
  "tree-sitter",
 ]

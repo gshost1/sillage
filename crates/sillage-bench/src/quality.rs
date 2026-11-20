@@ -9,12 +9,16 @@
 //!   the held-out features `H = F(held)`: precision `|A ∩ H| / |A|`,
 //!   recall `|A ∩ H| / |H|`.
 //!
-//! The best recommendation per query (by F1) is reported. Precision/recall are
+//! The best recommendation per query (by F1) is reported. Line-level metrics
+//! compare the *rendered* recommendation with the held-out text: added lines
+//! (recommended, non-placeholder) and held-out lines are whitespace-normalized;
+//! a query is an *exact match* when some recommendation's added lines all occur
+//! in the held-out half. Precision/recall are
 //! averaged over queries that produced at least one recommendation.
 //! Recommendations whose cluster contains the query's own method are excluded
 //! (leave-one-out), since the original is in the indexed corpus.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Instant;
 
 use sillage_core::{FeatureBag, SimplifiedTree};
@@ -22,7 +26,7 @@ use sillage_engine::{Engine, Recommendation, Timings};
 
 use crate::bootstrap::{mean, percentile};
 use crate::sample::{code_lines, sample_methods, split_half_from_lines};
-use crate::{PhaseLatency, QualityCfg, QualityReport};
+use crate::{ClusterSizes, PhaseLatency, QualityCfg, QualityReport};
 
 /// Minimum non-empty body lines for a quality sample (query gets ≥ 4 lines).
 pub const QUALITY_MIN_LINES: usize = 8;
@@ -73,6 +77,36 @@ pub fn extra_lines(tree: &SimplifiedTree, query_match: &[bool]) -> usize {
     lines.len()
 }
 
+/// A source line with all whitespace removed.
+fn norm_line(l: &str) -> String {
+    l.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Normalized non-empty lines of `text`.
+pub fn norm_lines(text: &str) -> HashSet<String> {
+    text.lines().map(norm_line).filter(|l| !l.is_empty()).collect()
+}
+
+/// `(precision, recall, exact)` of a recommendation's added rendered lines
+/// against the held-out lines (see module docs).
+pub fn line_match(rec: &Recommendation, query: &str, held: &HashSet<String>) -> (f64, f64, bool) {
+    let lay = sillage_render::layout(&rec.tree, &rec.query_match, Some(query));
+    let added: HashSet<String> = lay
+        .lines
+        .iter()
+        .filter(|l| l.extra && !l.placeholder)
+        .map(|l| norm_line(&l.text))
+        .filter(|l| !l.is_empty())
+        .collect();
+    if added.is_empty() {
+        return (0.0, 0.0, false);
+    }
+    let hits = added.intersection(held).count();
+    let p = hits as f64 / added.len() as f64;
+    let r = if held.is_empty() { 0.0 } else { hits as f64 / held.len() as f64 };
+    (p, r, hits == added.len())
+}
+
 /// Per-query outcome.
 #[derive(Debug, Clone, Default)]
 pub struct QueryOutcome {
@@ -82,20 +116,35 @@ pub struct QueryOutcome {
     pub extra_lines: Vec<usize>,
     pub ms: f64,
     pub timings: Timings,
+    /// `|cluster|` of each kept recommendation.
+    pub cluster_sizes: Vec<usize>,
+    /// Best `(line precision, line recall)` by line F1.
+    pub line_best: Option<(f64, f64)>,
+    pub exact: bool,
 }
 
-/// Scores the kept recommendations of one query.
+/// Scores the kept recommendations of one query (`query` / `held_text` are the
+/// two halves of the method).
 pub fn score_recommendations(
     engine: &Engine,
     fq: &FeatureBag,
     held: &FeatureBag,
+    query: &str,
+    held_text: &str,
     recs: &[&Recommendation],
 ) -> QueryOutcome {
     let mut out = QueryOutcome {
         recommendations: recs.len(),
         ..QueryOutcome::default()
     };
+    let held_lines = norm_lines(held_text);
     for rec in recs {
+        out.cluster_sizes.push(rec.cluster.len());
+        let (lp, lr, exact) = line_match(rec, query, &held_lines);
+        out.exact |= exact;
+        if out.line_best.is_none_or(|b| f1(lp, lr) > f1(b.0, b.1)) {
+            out.line_best = Some((lp, lr));
+        }
         let fr = engine.featurizer.featurize(&rec.tree).total();
         if containment(fq, &fr) >= engine.params.tau1 {
             out.contained = true;
@@ -122,6 +171,16 @@ pub fn aggregate(outcomes: &[QueryOutcome]) -> QualityReport {
         .flat_map(|o| o.extra_lines.iter().map(|&e| e as f64))
         .collect();
     let ms: Vec<f64> = outcomes.iter().map(|o| o.ms).collect();
+    let mut cluster_sizes = ClusterSizes::default();
+    for &c in outcomes.iter().flat_map(|o| &o.cluster_sizes) {
+        cluster_sizes.add(c);
+    }
+    let rate = |k: usize| if n == 0 { 0.0 } else { k as f64 / n as f64 };
+    let multi = outcomes.iter().filter(|o| o.cluster_sizes.iter().any(|&c| c > 1)).count();
+    let exact = outcomes.iter().filter(|o| o.exact).count();
+    let line_bests: Vec<(f64, f64)> = outcomes.iter().filter_map(|o| o.line_best).collect();
+    let lps: Vec<f64> = line_bests.iter().map(|b| b.0).collect();
+    let lrs: Vec<f64> = line_bests.iter().map(|b| b.1).collect();
     let max = |xs: &[f64]| xs.iter().copied().fold(0.0_f64, f64::max);
     let phase = |name: &str, get: fn(&Timings) -> f64| {
         let xs: Vec<f64> = outcomes.iter().map(|o| get(&o.timings)).collect();
@@ -149,6 +208,11 @@ pub fn aggregate(outcomes: &[QueryOutcome]) -> QualityReport {
         p95_ms: percentile(&ms, 95.0),
         max_ms: max(&ms),
         phases,
+        cluster_sizes,
+        multi_cluster_rate: rate(multi),
+        exact_match_rate: rate(exact),
+        avg_line_precision: mean(&lps),
+        avg_line_recall: mean(&lrs),
     }
 }
 
@@ -194,7 +258,7 @@ pub fn run(engine: &Engine, cfg: QualityCfg) -> anyhow::Result<QualityReport> {
             .iter()
             .filter(|r| !r.cluster.contains(&m.id))
             .collect();
-        let mut o = score_recommendations(engine, &fq, &held, &kept);
+        let mut o = score_recommendations(engine, &fq, &held, &query, &held_text, &kept);
         o.ms = ms;
         o.timings = output.timings.clone();
         outcomes.push(o);
@@ -261,11 +325,18 @@ mod tests {
     }
 
     #[test]
+    fn norm_lines_ignore_whitespace_and_blank_lines() {
+        let held = norm_lines("  return a + b;\n\n\tfoo( x );\n");
+        assert_eq!(held.len(), 2);
+        assert!(held.contains("returna+b;") && held.contains("foo(x);"));
+    }
+
+    #[test]
     fn aggregate_averages() {
         let outcomes = vec![
-            QueryOutcome { contained: true, recommendations: 2, best: Some((1.0, 0.5)), extra_lines: vec![2, 4], ms: 10.0, timings: Default::default() },
-            QueryOutcome { contained: false, recommendations: 0, best: None, extra_lines: vec![], ms: 30.0, timings: Default::default() },
-            QueryOutcome { contained: true, recommendations: 1, best: Some((0.5, 0.25)), extra_lines: vec![3], ms: 20.0, timings: Default::default() },
+            QueryOutcome { contained: true, recommendations: 2, best: Some((1.0, 0.5)), extra_lines: vec![2, 4], ms: 10.0, cluster_sizes: vec![1, 3], line_best: Some((1.0, 0.5)), exact: true, ..Default::default() },
+            QueryOutcome { contained: false, recommendations: 0, best: None, extra_lines: vec![], ms: 30.0, ..Default::default() },
+            QueryOutcome { contained: true, recommendations: 1, best: Some((0.5, 0.25)), extra_lines: vec![3], ms: 20.0, cluster_sizes: vec![7], line_best: Some((0.0, 0.0)), ..Default::default() },
         ];
         let r = aggregate(&outcomes);
         assert_eq!(r.sampled, 3);
@@ -276,6 +347,10 @@ mod tests {
         assert_eq!(r.avg_extra_lines, 3.0);
         assert_eq!(r.p50_ms, 20.0);
         assert!((r.p95_ms - 29.0).abs() < 1e-9);
+        assert_eq!(r.cluster_sizes, ClusterSizes { singleton: 1, two: 0, three_to_five: 1, six_plus: 1 });
+        assert!((r.multi_cluster_rate - 2.0 / 3.0).abs() < 1e-12);
+        assert!((r.exact_match_rate - 1.0 / 3.0).abs() < 1e-12);
+        assert_eq!((r.avg_line_precision, r.avg_line_recall), (0.5, 0.25));
         let empty = aggregate(&[]);
         assert_eq!(empty.sampled, 0);
         assert_eq!(empty.containment_rate, 0.0);

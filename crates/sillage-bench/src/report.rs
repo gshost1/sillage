@@ -48,6 +48,10 @@ pub fn quality_markdown(q: &QualityReport) -> String {
          | Avg recall of held-out features | {} |\n\
          | Avg recommendations / query | {:.2} |\n\
          | Avg extra lines / recommendation | {:.2} |\n\
+         | Exact-match rate (added lines ⊆ held-out) | {} |\n\
+         | Avg line precision / recall (best rec) | {} / {} |\n\
+         | Queries with a multi-method cluster | {} |\n\
+         | Cluster sizes (1 / 2 / 3–5 / 6+) | {} / {} / {} / {} |\n\
          | Latency p50 | {:.1} ms |\n\
          | Latency p95 | {:.1} ms |\n\
          | Latency max | {:.1} ms |\n",
@@ -57,6 +61,14 @@ pub fn quality_markdown(q: &QualityReport) -> String {
         pct(q.avg_recall),
         q.avg_recommendations,
         q.avg_extra_lines,
+        pct(q.exact_match_rate),
+        pct(q.avg_line_precision),
+        pct(q.avg_line_recall),
+        pct(q.multi_cluster_rate),
+        q.cluster_sizes.singleton,
+        q.cluster_sizes.two,
+        q.cluster_sizes.three_to_five,
+        q.cluster_sizes.six_plus,
         q.p50_ms,
         q.p95_ms,
         q.max_ms
@@ -142,10 +154,17 @@ mod tests {
             p95_ms: 56.78,
             max_ms: 99.0,
             phases: vec![crate::PhaseLatency { phase: "phase1".into(), p50_ms: 1.0, p95_ms: 2.0, max_ms: 3.0 }],
+            cluster_sizes: crate::ClusterSizes { singleton: 5, two: 2, three_to_five: 1, six_plus: 0 },
+            multi_cluster_rate: 0.15,
+            exact_match_rate: 0.125,
+            avg_line_precision: 0.5,
+            avg_line_recall: 0.2,
         };
         let md = quality_markdown(&q);
         assert!(md.starts_with("### Recommendation quality (half-snippet queries, 200 queries)"));
         assert!(md.contains("| Containment rate (≥ τ1) | 90.0% |"));
+        assert!(md.contains("| Exact-match rate (added lines ⊆ held-out) | 12.5% |"), "{md}");
+        assert!(md.contains("| Cluster sizes (1 / 2 / 3–5 / 6+) | 5 / 2 / 1 / 0 |"), "{md}");
         assert!(md.contains("| Avg precision of added features | 45.7% |"));
         assert!(md.contains("| Avg recommendations / query | 3.46 |"));
         assert!(md.contains("| Latency p95 | 56.8 ms |"));
