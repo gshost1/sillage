@@ -3,7 +3,7 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use rayon::prelude::*;
-use sillage_core::{Lang, MethodId};
+use sillage_core::{FeatureBag, Lang, MethodId};
 use sillage_engine::Engine;
 
 use crate::bootstrap::bootstrap_hits;
@@ -32,38 +32,56 @@ pub struct RecallQuery {
 pub struct Hits {
     /// Strict Recall@1: the original is ranked first.
     pub strict1: bool,
-    /// §5 Recall@1: strict, or the original is "100% similar" to the query and
-    /// tied with the top result (see [`ranked_hits`]).
+    /// §5 Recall@1: strict, or one of Decision 9's "100% similar" cases
+    /// (see [`hits`] and [`full_query_tie`]).
     pub r1: bool,
     /// Recall@100: the original is in the top [`DEPTH`].
     pub r100: bool,
 }
 
-/// Hits for a plain ranked id list (the BM25 and feature-search baselines).
-/// These systems have no similarity score comparable to `|F(q)|`, so their
-/// §5 Recall@1 is the strict one: ties are broken by `MethodId` ascending and
-/// get no credit.
-pub fn id_hits(orig: MethodId, results: &[MethodId]) -> Hits {
+/// Hits for a ranked id list. `top_same_as_orig` says whether the rank-1
+/// method is 100% similar to the original, i.e. has exactly the original's
+/// feature multiset `F(orig)` (a duplicate the corpus dedup did not catch, such
+/// as a renamed copy).
+///
+/// Decision 9 (§5): "Aroma should rank the original method body as number 1 in
+/// the reranked search result list, or the original method body should be 100%
+/// similar to the first code snippet in the ranked results." The clause is a
+/// property of the ground truth, not of the system, so it is applied to every
+/// system alike. A partial tie (equal pruned similarity, different methods)
+/// earns no credit.
+pub fn hits(orig: MethodId, results: &[MethodId], top_same_as_orig: bool) -> Hits {
     let strict1 = results.first() == Some(&orig);
     let r100 = results.iter().take(DEPTH).any(|&id| id == orig);
-    Hits { strict1, r1: strict1, r100 }
+    let r1 = strict1 || (!results.is_empty() && top_same_as_orig);
+    Hits { strict1, r1, r100 }
 }
 
-/// Hits for a reranked `(id, pruned sim)` list, where `query_total = |F(q)|`.
-///
-/// Decision 9 (§5's "100% similar" clause): Recall@1 also counts a hit when the
-/// original is in the list, ties the top result, *and* that shared similarity
-/// is the maximum `|F(q)|`, i.e. the original and the rank-1 method both contain
-/// the whole query and Sillage cannot tell them apart. A partial tie
-/// (`sim < |F(q)|`) is a miss, exactly as in strict Recall@1.
-pub fn ranked_hits(orig: MethodId, results: &[(MethodId, u64)], query_total: u64) -> Hits {
-    let found = results.iter().take(DEPTH).find(|(id, _)| *id == orig);
-    let strict1 = results.first().is_some_and(|&(id, _)| id == orig);
-    let tie_full = match (results.first(), found) {
-        (Some(&(_, top)), Some(&(_, sim))) => query_total > 0 && top == query_total && sim == top,
-        _ => false,
-    };
-    Hits { strict1, r1: strict1 || tie_full, r100: found.is_some() }
+/// Whether the original is in a reranked `(id, pruned sim)` list, tied with
+/// rank 1, at the full query similarity `|F(q)|` (`query_total`): both methods
+/// contain the whole query, so the query cannot tell them apart. Only Sillage
+/// has such a score; partial ties (`sim < |F(q)|`) do not count.
+pub fn full_query_tie(orig: MethodId, results: &[(MethodId, u64)], query_total: u64) -> bool {
+    let Some(&(_, top)) = results.first() else { return false };
+    query_total > 0
+        && top == query_total
+        && results.iter().take(DEPTH).any(|&(id, sim)| id == orig && sim == top)
+}
+
+/// [`hits`] with no duplicate credit (strict R@1 in both R@1 fields).
+pub fn id_hits(orig: MethodId, results: &[MethodId]) -> Hits {
+    hits(orig, results, false)
+}
+
+/// Whether `results[0]` is a different method with exactly `F(orig)`;
+/// `f_orig` is computed at most once per query.
+fn top_is_duplicate(engine: &Engine, orig: MethodId, results: &[MethodId], f_orig: &mut Option<Option<FeatureBag>>) -> bool {
+    let Some(&top) = results.first() else { return false };
+    if top == orig {
+        return false;
+    }
+    let fo = f_orig.get_or_insert_with(|| engine.method_features(orig));
+    fo.as_ref().is_some_and(|fo| engine.method_features(top).as_ref() == Some(fo))
 }
 
 /// Builds the sampled query set deterministically from `cfg`.
@@ -92,17 +110,22 @@ pub fn build_queries(engine: &Engine, cfg: &RecallCfg) -> Vec<RecallQuery> {
 /// Per-query hits `[bm25, features, sillage]`.
 /// Engine errors (e.g. unparsable snippets) count as misses.
 pub fn evaluate_query(engine: &Engine, q: &RecallQuery) -> [Hits; 3] {
-    let bm25 = id_hits(q.orig, &engine.bm25_search(q.lang, &q.snippet, DEPTH));
-    let feats = engine
-        .features_only(q.lang, &q.snippet, DEPTH)
-        .map(|ids| id_hits(q.orig, &ids))
-        .unwrap_or_default();
+    let mut f_orig = None;
+    let mut score = |ids: &[MethodId]| {
+        let dup = top_is_duplicate(engine, q.orig, ids, &mut f_orig);
+        hits(q.orig, ids, dup)
+    };
+    let bm25 = score(&engine.bm25_search(q.lang, &q.snippet, DEPTH));
+    let feats = engine.features_only(q.lang, &q.snippet, DEPTH).map(|ids| score(&ids)).unwrap_or_default();
     let sillage = engine
         .query_features(q.lang, &q.snippet)
         .map(|fq| {
             let rs = engine.search_features(q.lang, &fq, DEPTH);
             let pairs: Vec<(MethodId, u64)> = rs.iter().map(|r| (r.id, r.sim)).collect();
-            ranked_hits(q.orig, &pairs, fq.total())
+            let ids: Vec<MethodId> = pairs.iter().map(|p| p.0).collect();
+            let mut h = score(&ids);
+            h.r1 |= full_query_tie(q.orig, &pairs, fq.total());
+            h
         })
         .unwrap_or_default();
     [bm25, feats, sillage]
@@ -159,19 +182,30 @@ mod tests {
     }
 
     #[test]
-    fn ranked_hits_decision_9_tie_clause() {
-        // |F(q)| = 10.
-        assert_eq!(ranked_hits(A, &[(A, 10), (B, 10)], 10), h(true, true, true));
-        // Original ranked 2nd but 100% similar and tied with rank 1 → §5 hit, strict miss.
-        assert_eq!(ranked_hits(A, &[(B, 10), (A, 10)], 10), h(false, true, true));
-        // Stage 5: a *partial* tie (sim 8 < |F(q)| = 10) earns no §5 credit.
-        assert_eq!(ranked_hits(A, &[(B, 8), (A, 8)], 10), h(false, false, true));
-        // Original ranked 2nd and strictly less similar → miss@1.
-        assert_eq!(ranked_hits(A, &[(B, 10), (A, 9)], 10), h(false, false, true));
-        // Original absent → miss.
-        assert_eq!(ranked_hits(A, &[(B, 10), (C, 10)], 10), h(false, false, false));
-        // Empty query never earns tie credit.
-        assert_eq!(ranked_hits(A, &[(B, 0), (A, 0)], 0), h(false, false, true));
+    fn decision_9_duplicate_clause() {
+        // Rank-1 is a different method with exactly F(orig) → §5 hit, strict miss.
+        assert_eq!(hits(A, &[B, A], true), h(false, true, true));
+        // A mere tie (or anything else) is not a duplicate → miss@1.
+        assert_eq!(hits(A, &[B, A], false), h(false, false, true));
+        // The original first is always a hit.
+        assert_eq!(hits(A, &[A, B], false), h(true, true, true));
+        // No results → no credit even if flagged.
+        assert_eq!(hits(A, &[], true), h(false, false, false));
+        // Duplicate at rank 1 with the original beyond the depth.
+        assert_eq!(hits(A, &[B], true), h(false, true, false));
+    }
+
+    #[test]
+    fn decision_9_full_query_tie() {
+        // |F(q)| = 10: tied at rank 1 with the whole query → credit.
+        assert!(full_query_tie(A, &[(B, 10), (A, 10)], 10));
+        // Partial tie (8 < |F(q)|) → no credit.
+        assert!(!full_query_tie(A, &[(B, 8), (A, 8)], 10));
+        // Not tied, absent, empty query → no credit.
+        assert!(!full_query_tie(A, &[(B, 10), (A, 9)], 10));
+        assert!(!full_query_tie(A, &[(B, 10), (C, 10)], 10));
+        assert!(!full_query_tie(A, &[(B, 0), (A, 0)], 0));
+        assert!(!full_query_tie(A, &[], 10));
     }
 
     #[test]

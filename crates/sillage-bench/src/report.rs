@@ -42,10 +42,11 @@ pub fn recall_markdown(r: &RecallReport) -> String {
 }
 
 /// How ties are scored, printed under every recall table.
-pub const TIE_NOTE: &str = "Strict R@1: the original method is ranked first. §5 R@1 adds the paper's \
-\"100% similar\" clause for Sillage only: an original tied with rank 1 counts when both reach the full \
-query similarity |F(q)|. BM25 and feature search break ties by method id and get no tie credit \
-(their two R@1 columns are equal).";
+pub const TIE_NOTE: &str = "Strict R@1: the original method is ranked first (ties broken by method id); \
+this is the like-for-like column. §5 R@1 adds the paper's \"100% similar\" clause: (a) for every system, \
+the rank-1 method has exactly the original's feature multiset (an undeduplicated copy); (b) for Sillage \
+only, the original ties rank 1 at the full query similarity |F(q)|. BM25 and feature search have no \
+score comparable to |F(q)|, so (b) does not apply to them. Partial ties earn no credit.";
 
 pub fn recall_json(r: &RecallReport) -> String {
     serde_json::to_string_pretty(r).expect("recall report serializes")

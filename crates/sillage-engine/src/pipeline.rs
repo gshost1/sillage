@@ -44,6 +44,12 @@ impl Engine {
         sillage_parse::parse_method(rec.lang, &rec.text, rec.body).ok()
     }
 
+    /// `F(m)`: the full features of corpus method `id`'s body (`None` when it
+    /// does not parse).
+    pub fn method_features(&self, id: MethodId) -> Option<FeatureBag> {
+        Some(self.featurizer.featurize(&self.load_tree(id)?).total())
+    }
+
     /// Phases I and II, keeping the exact top `k` of the reranked list
     /// (see [`rerank_top`]); returns `(ranked, candidates parsed)`.
     fn ranked_top(&self, lang: Lang, fq: &FeatureBag, k: usize) -> (Vec<Ranked>, usize) {

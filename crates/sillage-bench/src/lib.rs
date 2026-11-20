@@ -36,8 +36,9 @@ pub struct Ci {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallRow {
     pub system: String,
-    /// §5 Recall@1: strict, plus Sillage's "100% similar" exact-tie credit
-    /// (Decision 9; equal to the strict value for the baselines).
+    /// §5 Recall@1 (Decision 9): strict, or the rank-1 method is a feature
+    /// duplicate of the original (every system), or the original ties rank 1
+    /// at the full query similarity `|F(q)|` (Sillage only).
     pub recall_at_1: Ci,
     pub recall_at_100: Ci,
     /// Strict Recall@1: the original method is ranked first.

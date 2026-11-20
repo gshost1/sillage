@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use rayon::prelude::*;
-use sillage_bench::recall::{build_queries, ranked_hits};
+use sillage_bench::recall::{build_queries, full_query_tie, hits};
 use sillage_bench::{RecallCfg, RecallMode};
 use sillage_core::{Featurizer, MethodId, Params};
 use sillage_engine::Engine;
@@ -71,7 +71,6 @@ fn main() -> anyhow::Result<()> {
         .map(|q| {
             // Keep only (id, sim, overlap): full `Ranked` values hold two trees
             // each, and 1000 queries x 100 of them need several GB.
-            let total = engine.query_features(q.lang, &q.snippet).map(|f| f.total()).unwrap_or(0);
             let ranked: Vec<Hit> = engine
                 .search(q.lang, &q.snippet, 100)
                 .unwrap_or_default()
@@ -79,7 +78,14 @@ fn main() -> anyhow::Result<()> {
                 .map(|r| Hit { id: r.id, sim: r.sim, overlap: r.overlap })
                 .collect();
             let pairs: Vec<(MethodId, u64)> = ranked.iter().map(|r| (r.id, r.sim)).collect();
-            (ranked_hits(q.orig, &pairs, total), ranked)
+            let ids: Vec<MethodId> = pairs.iter().map(|p| p.0).collect();
+            let dup = ids.first().is_some_and(|&t| {
+                t != q.orig && engine.method_features(t).is_some() && engine.method_features(t) == engine.method_features(q.orig)
+            });
+            let total = engine.query_features(q.lang, &q.snippet).map(|f| f.total()).unwrap_or(0);
+            let mut h = hits(q.orig, &ids, dup);
+            h.r1 |= full_query_tie(q.orig, &pairs, total);
+            (h, ranked)
         })
         .collect();
     let misses: Vec<usize> = (0..queries.len()).filter(|&i| !results[i].0.r1).collect();
@@ -105,6 +111,15 @@ fn main() -> anyhow::Result<()> {
         h.finish()
     };
     println!("query set fingerprint {fingerprint:016x}");
+    // Pre-Stage 5 rule, for comparison only: any equal-similarity tie with rank 1.
+    let rate = |f: &dyn Fn(usize) -> bool| 100.0 * (0..queries.len()).filter(|&i| f(i)).count() as f64 / queries.len().max(1) as f64;
+    let strict = rate(&|i| results[i].0.strict1);
+    let s5 = rate(&|i| results[i].0.r1);
+    let legacy = rate(&|i| {
+        let r = &results[i].1;
+        r.first().is_some_and(|t| t.id == queries[i].orig || r.iter().any(|x| x.id == queries[i].orig && x.sim == t.sim))
+    });
+    println!("Sillage R@1: strict {strict:.1}%  §5 {s5:.1}%  legacy any-tie {legacy:.1}%");
     if let Some(path) = std::env::var_os("SILLAGE_DUMP") {
         let all: String = queries.iter().map(|q| format!("=== {}\n{}\n", q.orig.0, q.snippet)).collect();
         std::fs::write(path, all)?;
