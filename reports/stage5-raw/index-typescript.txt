@@ -1,0 +1,3 @@
+warning: 17 source files could not be read or are not valid UTF-8
+indexed 5592 methods, 94430 features, 392512 postings in 1.1s -> data/typescript.sil
+wall 1.13 s, maxrss 108676 KB

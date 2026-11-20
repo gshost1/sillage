@@ -1,0 +1,2 @@
+indexed 80192 methods, 883117 features, 5288669 postings in 6.5s -> data/java.sil
+wall 6.51 s, maxrss 603016 KB

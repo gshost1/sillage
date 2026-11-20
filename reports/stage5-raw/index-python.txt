@@ -1,0 +1,2 @@
+indexed 8554 methods, 174168 features, 633839 postings in 0.8s -> data/python.sil
+wall 0.82 s, maxrss 98144 KB

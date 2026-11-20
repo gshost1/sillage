@@ -1,0 +1,2 @@
+indexed 3729 methods, 121792 features, 449666 postings in 0.6s -> data/go.sil
+wall 0.63 s, maxrss 74836 KB

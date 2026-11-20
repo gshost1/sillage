@@ -1,0 +1,3 @@
+query set fingerprint 51f282b217bd929b
+Sillage R@1: strict 79.8%  §5 84.5%  legacy any-tie 95.5%
+1000 queries, 155 R@1 misses (84.5%) | orig rank 2: 74 | 3-5: 39 | 6-10: 14 | 11-100: 21 | absent: 7
