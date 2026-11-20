@@ -9,6 +9,7 @@ sillage-core.workspace = true
 sillage-parse.workspace = true
 sillage-index.workspace = true
 sillage-engine.workspace = true
+tree-sitter.workspace = true
 anyhow.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

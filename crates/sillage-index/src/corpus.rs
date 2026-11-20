@@ -7,9 +7,10 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
-use sillage_core::{Lang, MethodId, MethodRecord};
+use sillage_core::{Featurizer, Lang, MethodId, MethodRecord};
 
 use crate::hash::content_hash;
+use crate::index::{InvertedIndex, feature_bag};
 
 /// Files larger than this are skipped (generated / minified sources).
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -33,6 +34,32 @@ struct SourceFile {
 /// Ordering is deterministic: methods are sorted by `(repo, path, line_start, name)`
 /// and assigned `MethodId(0..)`; the first occurrence of each duplicate is kept.
 pub fn build_corpus(root: &Path, langs: &[Lang]) -> Corpus {
+    let methods = collect(root, langs, |_| ());
+    Corpus { methods: methods.into_iter().map(|(m, ())| m).collect() }
+}
+
+/// [`build_corpus`] and [`InvertedIndex::build`] in one pass: each method's tree
+/// from extraction is featurized directly instead of being re-parsed, giving
+/// exactly the same corpus and index.
+pub fn build_corpus_and_index(root: &Path, langs: &[Lang], featurizer: &dyn Featurizer) -> (Corpus, InvertedIndex) {
+    let methods = collect(root, langs, |m| feature_bag(&m.tree, featurizer));
+    let n = methods.len();
+    let mut records = Vec::with_capacity(n);
+    let mut bags = Vec::with_capacity(n);
+    for (rec, bag) in methods {
+        bags.push((rec.id, bag));
+        records.push(rec);
+    }
+    (Corpus { methods: records }, InvertedIndex::from_bags(bags, n))
+}
+
+/// Walks, reads, deduplicates and extracts; `payload` is computed per extracted
+/// method (in parallel, from its already-parsed tree) and kept alongside it.
+fn collect<T: Send>(
+    root: &Path,
+    langs: &[Lang],
+    payload: impl Fn(&sillage_parse::ExtractedMethod) -> T + Sync,
+) -> Vec<(MethodRecord, T)> {
     let mut candidates: Vec<(PathBuf, Lang)> = ignore::WalkBuilder::new(root)
         .build()
         .filter_map(Result::ok)
@@ -60,37 +87,38 @@ pub fn build_corpus(root: &Path, langs: &[Lang]) -> Corpus {
     let files = dedup_projects(files);
     let files = dedup_files(files);
 
-    let mut methods: Vec<MethodRecord> = files
+    let mut methods: Vec<(MethodRecord, T)> = files
         .par_iter()
         .flat_map_iter(|f| {
             sillage_parse::extract_methods(f.lang, &f.src)
                 .into_iter()
                 .filter_map(|m| {
                     let text = f.src.get(m.text_span.start as usize..m.text_span.end as usize)?;
-                    Some(MethodRecord {
+                    let rec = MethodRecord {
                         id: MethodId(0),
                         lang: f.lang,
                         repo: f.repo.clone(),
                         path: f.path.clone(),
-                        name: m.name,
+                        name: m.name.clone(),
                         line_start: m.line_start,
                         text: Arc::from(text),
                         body: m.body_span,
-                    })
+                    };
+                    Some((rec, payload(&m)))
                 })
                 .collect::<Vec<_>>()
         })
         .collect();
-    methods.sort_by(|a, b| {
+    methods.sort_by(|(a, _), (b, _)| {
         (&a.repo, &a.path, a.line_start, &a.name).cmp(&(&b.repo, &b.path, b.line_start, &b.name))
     });
 
     let mut seen = FxHashSet::default();
-    methods.retain(|m| seen.insert(method_hash(m)));
-    for (i, m) in methods.iter_mut().enumerate() {
+    methods.retain(|(m, _)| seen.insert(method_hash(m)));
+    for (i, (m, _)) in methods.iter_mut().enumerate() {
         m.id = MethodId(i as u32);
     }
-    Corpus { methods }
+    methods
 }
 
 fn split_repo(rel: &Path) -> Option<(Box<str>, Box<str>)> {

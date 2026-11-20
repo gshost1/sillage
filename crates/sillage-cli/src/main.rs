@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use sillage_bench::{QualityCfg, RecallCfg, RecallMode};
 use sillage_core::{Lang, MethodId, MethodRecord, NodeId, NodeKind, Params, SimplifiedTree};
 use sillage_engine::Engine;
-use sillage_index::{AromaFeaturizer, Bm25, InvertedIndex};
+use sillage_index::{AromaFeaturizer, Bm25};
 use sillage_render::Style;
 
 #[derive(Debug, Parser)]
@@ -301,8 +301,7 @@ fn cmd_fetch(manifest_path: &Path, out: &Path) -> anyhow::Result<()> {
 fn cmd_index(corpus_dir: &Path, out: &Path, langs: &[Lang]) -> anyhow::Result<()> {
     let langs: Vec<Lang> = if langs.is_empty() { Lang::ALL.to_vec() } else { langs.to_vec() };
     let t0 = std::time::Instant::now();
-    let corpus = sillage_index::build_corpus(corpus_dir, &langs);
-    let inv = InvertedIndex::build(&corpus, &AromaFeaturizer);
+    let (corpus, inv) = sillage_index::build_corpus_and_index(corpus_dir, &langs, &AromaFeaturizer);
     let bm25 = Bm25::build(&corpus);
     sillage_index::save(out, &corpus, &inv, &bm25)?;
     println!(

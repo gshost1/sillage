@@ -108,7 +108,7 @@ fn save_load_roundtrip() {
 
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[..8], b"SILLAGE1");
-    assert_eq!(&bytes[8..12], &1u32.to_le_bytes());
+    assert_eq!(&bytes[8..12], &sillage_index::FORMAT_VERSION.to_le_bytes());
 
     let (c2, i2, b2) = load(&path).unwrap();
     assert_eq!(c2.methods, corpus.methods);

@@ -161,3 +161,35 @@ fn aroma_query_ranks_itself_first() {
     let hits = index.search(&q, 10);
     assert_eq!(hits[0], (MethodId(1), q.set_len() as u32));
 }
+
+proptest! {
+    /// `search_bounded` agrees with `search` and its bound is the multiset
+    /// overlap `Σ min(q_f, m_f)` (counts below saturation).
+    #[test]
+    fn bounded_search_matches_multiset_oracle(
+        methods in prop::collection::vec(prop::collection::vec(0u64..20, 0..40), 0..30),
+        query in prop::collection::vec((0u64..25, 1u32..5), 0..20),
+        eta1 in 0usize..40,
+    ) {
+        let index = build(&methods);
+        let bag = FeatureBag::from_weighted(query.iter().copied());
+        let hits = index.search_bounded(&bag, eta1);
+        let plain: Vec<(MethodId, u32)> = hits.iter().map(|h| (h.id, h.overlap)).collect();
+        prop_assert_eq!(plain, index.search(&bag, eta1));
+        for h in hits {
+            let m = FeatureBag::from_unsorted(methods[h.id.0 as usize].iter().copied());
+            prop_assert_eq!(h.bound, bag.intersect_count(&m));
+        }
+    }
+}
+
+#[test]
+fn saturated_counts_stay_valid_bounds() {
+    // 300 copies of feature 1 saturate the stored count: the bound must still
+    // cover the query's full multiplicity of that feature.
+    let index = build(&[vec![1; 300], vec![1; 3]]);
+    let q = FeatureBag::from_weighted([(1, 400)]);
+    let hits = index.search_bounded(&q, 10);
+    assert_eq!(hits[0].bound, 400);
+    assert_eq!(hits[1].bound, 3);
+}

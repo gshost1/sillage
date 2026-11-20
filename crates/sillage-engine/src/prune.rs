@@ -68,6 +68,14 @@ fn add(cur: &mut [u32], leaf: &[(usize, u32)]) {
 
 /// `Prune(F(q), m)` with lazy-greedy evaluation.
 pub fn prune(fq: &FeatureBag, m: &SimplifiedTree, lf: &LeafFeatures) -> Pruned {
+    let (keep, sim) = prune_keep(fq, m, lf);
+    let tree = m.retain(&keep);
+    Pruned { keep, sim, tree }
+}
+
+/// The leaf selection and `SimScore` of [`prune`], without building the pruned
+/// tree (`m.retain(&keep)`), for candidates that are only scored.
+pub fn prune_keep(fq: &FeatureBag, m: &SimplifiedTree, lf: &LeafFeatures) -> (Vec<bool>, u64) {
     let n = m.leaves.len();
     debug_assert_eq!(lf.per_leaf.len(), n, "LeafFeatures must align with tree.leaves");
     let p = project(fq, lf, n);
@@ -99,9 +107,7 @@ pub fn prune(fq: &FeatureBag, m: &SimplifiedTree, lf: &LeafFeatures) -> Pruned {
             heap.push(fresh);
         }
     }
-
-    let tree = m.retain(&keep);
-    Pruned { keep, sim, tree }
+    (keep, sim)
 }
 
 /// Reference `O(|N|²)` implementation of Algorithm 1 used to validate [`prune`].

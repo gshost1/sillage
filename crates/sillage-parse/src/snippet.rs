@@ -168,25 +168,45 @@ pub(crate) fn parse_method(lang: Lang, text: &str, body: Span) -> Result<Simplif
 }
 
 /// Root of the body: the lowest common ancestor of every terminal inside `body`.
+///
+/// Nodes are numbered in preorder, so the LCA of a node set is the LCA of its
+/// smallest and largest member.
 fn body_root(tree: &SimplifiedTree, body: Span) -> Option<NodeId> {
     let inside = |sp: Span| sp.start >= body.start && sp.end <= body.end && !sp.is_empty();
-    let mut lca: Option<Vec<NodeId>> = None;
+    let mut ends: Option<(NodeId, NodeId)> = None;
     for (id, node) in tree.nodes.iter().enumerate() {
-        if !node.children.is_empty() || !inside(node.span) {
-            continue;
+        if node.children.is_empty() && inside(node.span) {
+            let id = id as NodeId;
+            ends = Some(ends.map_or((id, id), |(lo, _)| (lo, id)));
         }
-        let mut path: Vec<NodeId> = vec![id as NodeId];
-        path.extend(tree.ancestors(id as NodeId).map(|(a, _)| a));
-        path.reverse();
-        lca = Some(match lca {
-            None => path,
-            Some(prev) => prev.iter().zip(&path).take_while(|(a, b)| a == b).map(|(a, _)| *a).collect(),
-        });
     }
-    lca.and_then(|p| p.last().copied())
+    let (lo, hi) = ends?;
+    let path = |n: NodeId| {
+        let mut p: Vec<NodeId> = vec![n];
+        p.extend(tree.ancestors(n).map(|(a, _)| a));
+        p.reverse();
+        p
+    };
+    let (a, b) = (path(lo), path(hi));
+    a.iter().zip(&b).take_while(|(x, y)| x == y).map(|(x, _)| *x).last()
 }
 
-fn body_subtree(tree: SimplifiedTree, body: Span) -> SimplifiedTree {
+/// `true` when every node's children have larger IDs that form, with their own
+/// subtrees, consecutive preorder ranges (what [`crate::lower::build`] produces).
+fn is_preorder(tree: &SimplifiedTree) -> bool {
+    let mut next: NodeId = 0;
+    let mut stack: Vec<NodeId> = vec![0];
+    while let Some(n) = stack.pop() {
+        if n != next {
+            return false;
+        }
+        next += 1;
+        stack.extend(tree.nodes[n as usize].children.iter().rev());
+    }
+    next as usize == tree.nodes.len()
+}
+
+fn body_subtree(mut tree: SimplifiedTree, body: Span) -> SimplifiedTree {
     if tree.is_empty() || body.is_empty() || body.end as usize > tree.source.len() {
         return tree;
     }
@@ -196,6 +216,35 @@ fn body_subtree(tree: SimplifiedTree, body: Span) -> SimplifiedTree {
     if root == 0 {
         return tree;
     }
+    if !is_preorder(&tree) {
+        return copy_subtree(&tree, root);
+    }
+    // The subtree of `root` is the preorder range `root..end`: move it out and
+    // shift every ID down by `root`.
+    let mut end = root;
+    loop {
+        match tree.nodes[end as usize].children.last() {
+            Some(&c) => end = c,
+            None => break,
+        }
+    }
+    let (lo, hi) = (root as usize, end as usize + 1);
+    let mut nodes: Vec<SNode> = tree.nodes.drain(lo..hi).collect();
+    nodes[0].parent = None;
+    nodes[0].index_in_parent = 0;
+    for n in &mut nodes {
+        n.parent = n.parent.map(|p| p - root);
+        for c in &mut n.children {
+            *c -= root;
+        }
+    }
+    let leaves = tree.leaves.iter().filter(|&&l| (lo..hi).contains(&(l as usize))).map(|&l| l - root).collect();
+    SimplifiedTree { lang: tree.lang, source: tree.source, nodes, leaves }
+}
+
+/// Deep copy of the subtree at `root` (fallback for non-preorder trees, and the
+/// reference for [`body_subtree`]'s range move).
+fn copy_subtree(tree: &SimplifiedTree, root: NodeId) -> SimplifiedTree {
     let mut out = SimplifiedTree::empty(tree.lang, Arc::clone(&tree.source));
     fn copy(src: &SimplifiedTree, id: NodeId, parent: Option<NodeId>, out: &mut SimplifiedTree) -> NodeId {
         let n = &src.nodes[id as usize];
@@ -215,7 +264,7 @@ fn body_subtree(tree: SimplifiedTree, body: Span) -> SimplifiedTree {
         out.nodes[new_id as usize].children = kids;
         new_id
     }
-    copy(&tree, root, None, &mut out);
+    copy(tree, root, None, &mut out);
     out
 }
 
@@ -349,4 +398,77 @@ pub(crate) fn closers(lang: Lang, s: &str) -> String {
         i += 1;
     }
     stack.iter().rev().map(|&c| c as char).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The preorder range move equals a deep copy of the body subtree, for
+    /// methods in every language (incl. nested functions and lambdas).
+    #[test]
+    fn body_range_move_equals_copy() {
+        let cases: &[(Lang, &str)] = &[
+            (Lang::Java, "class A {\n  int f(int a) {\n    int b = a + 1;\n    for (int i = 0; i < b; i++) { g(i, () -> { return i * 2; }); }\n    return b;\n  }\n  A() { this(1); }\n}\n"),
+            (Lang::Python, "def f(a, b=2):\n    def inner(x):\n        return x + a\n    return [inner(y) for y in range(b)]\n"),
+            (Lang::JavaScript, "function f(a) {\n  const g = (x) => x + a;\n  return `v ${g(1)}`;\n}\nclass C { m(y) { return y.z(); } }\n"),
+            (Lang::TypeScript, "function f(a: number): number {\n  let b: number = a * 2;\n  return b;\n}\n"),
+            (Lang::Go, "package p\nfunc f(a int) int {\n\tb := a + 1\n\tfor i := 0; i < b; i++ {\n\t\tb += i\n\t}\n\treturn b\n}\n"),
+            (Lang::Rust, "fn f(a: u32) -> u32 {\n    let b = a + 1;\n    match b { 0 => 1, n => n * 2 }\n}\nimpl S { fn g(&self) -> u8 { self.0 } }\n"),
+        ];
+        let mut checked = 0;
+        for &(lang, src) in cases {
+            for m in crate::extract_methods(lang, src) {
+                let text = &src[m.text_span.start as usize..m.text_span.end as usize];
+                let full = parse_method_full(lang, text).unwrap();
+                let root = body_root(&full, m.body_span).unwrap();
+                assert!(is_preorder(&full), "{lang}: {}", m.name);
+                let moved = body_subtree(full.clone(), m.body_span);
+                let copied = if root == 0 { full.clone() } else { copy_subtree(&full, root) };
+                assert_eq!(moved, copied, "{lang}: {}", m.name);
+                moved.validate().unwrap();
+                checked += 1;
+            }
+        }
+        assert!(checked >= 10, "{checked}");
+    }
+
+    /// Same check over every method of a real corpus (`SILLAGE_CORPUS`, default
+    /// `../../data/corpus`): `cargo test -p sillage-parse --release -- --ignored`.
+    #[test]
+    #[ignore]
+    fn body_range_move_equals_copy_on_corpus() {
+        let root = std::env::var("SILLAGE_CORPUS").unwrap_or_else(|_| "../../data/corpus".into());
+        let mut stack = vec![std::path::PathBuf::from(root)];
+        let (mut files, mut methods) = (0usize, 0usize);
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                let Some(lang) = crate::lang_from_path(&p) else { continue };
+                let Ok(src) = std::fs::read_to_string(&p) else { continue };
+                if src.len() > 2 * 1024 * 1024 {
+                    continue;
+                }
+                files += 1;
+                for m in crate::extract_methods(lang, &src) {
+                    let text = &src[m.text_span.start as usize..m.text_span.end as usize];
+                    let full = parse_method_full(lang, text).unwrap();
+                    let copied = match body_root(&full, m.body_span) {
+                        _ if full.is_empty() || m.body_span.is_empty() => full.clone(),
+                        None => SimplifiedTree::empty(lang, Arc::clone(&full.source)),
+                        Some(0) => full.clone(),
+                        Some(r) => copy_subtree(&full, r),
+                    };
+                    assert_eq!(body_subtree(full, m.body_span), copied, "{}: {}", p.display(), m.name);
+                    methods += 1;
+                }
+            }
+        }
+        eprintln!("{files} files, {methods} methods checked");
+    }
 }

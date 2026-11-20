@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use sillage_core::{Lang, Params};
 use sillage_engine::Engine;
-use sillage_index::{AromaFeaturizer, Bm25, InvertedIndex};
+use sillage_index::{AromaFeaturizer, Bm25};
 
 /// Paper Listing 4 (query).
 pub const LISTING4: &str = "\
@@ -132,9 +132,8 @@ pub fn write_paper_corpus(root: &Path) {
 
 /// Real pipeline: walk → index → BM25 → save → load → engine.
 pub fn engine_for(corpus_dir: &Path, langs: &[Lang], index_path: &Path) -> Engine {
-    let corpus = sillage_index::build_corpus(corpus_dir, langs);
+    let (corpus, inv) = sillage_index::build_corpus_and_index(corpus_dir, langs, &AromaFeaturizer);
     assert!(!corpus.methods.is_empty(), "empty corpus under {}", corpus_dir.display());
-    let inv = InvertedIndex::build(&corpus, &AromaFeaturizer);
     let bm25 = Bm25::build(&corpus);
     sillage_index::save(index_path, &corpus, &inv, &bm25).unwrap();
     let (corpus, inv, bm25) = sillage_index::load(index_path).unwrap();

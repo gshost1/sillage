@@ -8,7 +8,7 @@ use sillage_core::{FeatureBag, Lang, MethodId, MethodRecord, SimplifiedTree};
 
 use crate::{
     Engine, Output, Ranked, Recommendation, Timings, cluster::cluster_scored, complete_calls, intersect, prune,
-    rerank,
+    rerank, rerank_top,
 };
 
 fn ms(t: Instant) -> f64 {
@@ -28,22 +28,35 @@ impl Engine {
         Ok(self.featurizer.featurize(&tree).total())
     }
 
-    /// Phase I + candidate re-parse (methods that fail to parse are skipped).
-    fn phase1(&self, fq: &FeatureBag) -> Vec<(MethodId, u32, SimplifiedTree)> {
-        let hits = self.index.search(fq, self.params.eta1);
-        hits.into_par_iter()
-            .filter_map(|(id, overlap)| {
-                let rec = self.record(id)?;
-                let tree = sillage_parse::parse_method(rec.lang, &rec.text, rec.body).ok()?;
-                Some((id, overlap, tree))
-            })
-            .collect()
+    /// Re-parses a Phase I candidate (methods that fail to parse are skipped).
+    fn load_tree(&self, id: MethodId) -> Option<SimplifiedTree> {
+        let rec = self.record(id)?;
+        sillage_parse::parse_method(rec.lang, &rec.text, rec.body).ok()
+    }
+
+    /// Phases I and II, keeping the exact top `k` of the reranked list
+    /// (see [`rerank_top`]); returns `(ranked, candidates parsed)`.
+    fn ranked_top(&self, fq: &FeatureBag, k: usize) -> (Vec<Ranked>, usize) {
+        let hits = self.index.search_bounded(fq, self.params.eta1);
+        rerank_top(fq, hits, k, None, self.featurizer.as_ref(), |id| self.load_tree(id))
     }
 
     /// Structural code search: Phases I and II, truncated to `n`.
     pub fn search(&self, lang: Lang, snippet: &str, n: usize) -> anyhow::Result<Vec<Ranked>> {
         let fq = self.query_features(lang, snippet)?;
-        let cands = self.phase1(&fq);
+        Ok(self.ranked_top(&fq, n).0)
+    }
+
+    /// Phases I and II over all η1 candidates, re-parsing every one of them
+    /// (the unbounded reference for [`search`](Self::search)).
+    pub fn search_exhaustive(&self, lang: Lang, snippet: &str, n: usize) -> anyhow::Result<Vec<Ranked>> {
+        let fq = self.query_features(lang, snippet)?;
+        let cands: Vec<(MethodId, u32, SimplifiedTree)> = self
+            .index
+            .search(&fq, self.params.eta1)
+            .into_par_iter()
+            .filter_map(|(id, overlap)| Some((id, overlap, self.load_tree(id)?)))
+            .collect();
         let mut ranked = rerank(&fq, cands, self.featurizer.as_ref());
         ranked.truncate(n);
         Ok(ranked)
@@ -69,12 +82,17 @@ impl Engine {
         let fq = self.query_features(lang, snippet)?;
         let parse_ms = ms(t);
 
+        // Only the top η2 of N2 above τ1 reach Phase III (`cluster` takes the
+        // first η2 candidates with score > τ1, a prefix of the ranking), so N2
+        // is computed only that far.
         let t = Instant::now();
-        let cands = self.phase1(&fq);
+        let hits = self.index.search_bounded(&fq, self.params.eta1);
         let phase1_ms = ms(t);
 
         let t = Instant::now();
-        let n2 = rerank(&fq, cands, featurizer);
+        let (n2, parsed) = rerank_top(&fq, hits, self.params.eta2, Some(self.params.tau1), featurizer, |id| {
+            self.load_tree(id)
+        });
         let phase2_ms = ms(t);
 
         let t = Instant::now();
@@ -102,7 +120,7 @@ impl Engine {
         Ok(Output {
             n2,
             recommendations,
-            timings: Timings { parse_ms, phase1_ms, phase2_ms, phase3_ms, total_ms: ms(start) },
+            timings: Timings { parse_ms, phase1_ms, phase2_ms, phase3_ms, total_ms: ms(start), parsed },
         })
     }
 }

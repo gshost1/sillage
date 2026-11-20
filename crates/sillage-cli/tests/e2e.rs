@@ -555,6 +555,42 @@ fn all_languages_end_to_end() {
     assert_eq!(Lang::Go.placeholder(), "// ...");
 }
 
+/// The single-pass indexer equals walk + `InvertedIndex::build`, and the bounded
+/// Phase II (`search`, `recommend`) equals exhaustive reranking, on every language.
+#[test]
+fn single_pass_index_and_bounded_rerank_are_exact() {
+    let dir = scratch("exact");
+    let mut corpora: Vec<(Vec<Lang>, std::path::PathBuf, Vec<&str>)> = Vec::new();
+    let paper = dir.path().join("paper");
+    write_paper_corpus(&paper);
+    corpora.push((vec![Lang::Java], paper, vec![LISTING4, "view.getChildAt(i);", "for (int i = 0; i < n; i++) {"]));
+    for case in CASES {
+        let corpus = dir.path().join(format!("corpus-{}", case.lang));
+        write(&corpus, &format!("ra/src/a.{}", case.ext), case.a);
+        write(&corpus, &format!("rb/src/b.{}", case.ext), case.b);
+        write(&corpus, &format!("rc/src/c.{}", case.ext), case.distractor);
+        corpora.push((vec![case.lang], corpus, vec![case.query]));
+    }
+    for (langs, root, queries) in corpora {
+        let (c1, i1) = sillage_index::build_corpus_and_index(&root, &langs, &AromaFeaturizer);
+        let c2 = sillage_index::build_corpus(&root, &langs);
+        let i2 = sillage_index::InvertedIndex::build(&c2, &AromaFeaturizer);
+        assert_eq!(c1.methods, c2.methods, "{langs:?}");
+        assert_eq!(i1, i2, "{langs:?}");
+        let mut params = sillage_core::Params::default();
+        params.eta2 = 2; // force the bound to prune candidates
+        let engine = sillage_engine::Engine::new(c1, i1, sillage_index::Bm25::build(&c2), Box::new(AromaFeaturizer), params);
+        for q in queries {
+            for n in [1, 2, 3, 100] {
+                let a = engine.search(langs[0], q, n).unwrap();
+                let b = engine.search_exhaustive(langs[0], q, n).unwrap();
+                let key = |r: &sillage_engine::Ranked| (r.id, r.sim, r.overlap, r.pruned.keep.clone());
+                assert_eq!(a.iter().map(key).collect::<Vec<_>>(), b.iter().map(key).collect::<Vec<_>>(), "{langs:?} n={n} {q:?}");
+            }
+        }
+    }
+}
+
 /// Comments are not tree nodes: rendering a full body keeps them verbatim (no
 /// `// ...` placeholder), while a dropped code line still becomes one, even when
 /// it starts like a comment continuation (`*deref`).

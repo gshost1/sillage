@@ -178,8 +178,9 @@ pub fn run(engine: &Engine, cfg: QualityCfg) -> anyhow::Result<QualityReport> {
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if std::env::var_os("SILLAGE_TRACE").is_some() {
             eprintln!(
-                "[quality] {:>9.1} ms  n2={} recs={}  {}:{}:{} {}",
+                "[quality] {:>9.1} ms  parsed={} n2={} recs={}  {}:{}:{} {}",
                 ms,
+                output.timings.parsed,
                 output.n2.len(),
                 output.recommendations.len(),
                 m.repo,

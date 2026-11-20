@@ -864,6 +864,7 @@ dependencies = [
  "sillage-index",
  "sillage-parse",
  "toml",
+ "tree-sitter",
 ]
 
 [[package]]

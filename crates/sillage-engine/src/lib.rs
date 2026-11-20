@@ -11,8 +11,8 @@ mod rerank;
 pub use cluster::{ScoredCluster, cluster, cluster_scored};
 pub use complete::complete_calls;
 pub use intersect::intersect;
-pub use prune::prune;
-pub use rerank::rerank;
+pub use prune::{prune, prune_keep};
+pub use rerank::{rerank, rerank_top};
 
 use serde::{Deserialize, Serialize};
 use sillage_core::{Featurizer, MethodId, Params, SimplifiedTree};
@@ -46,15 +46,24 @@ pub struct Recommendation {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Timings {
+    /// Query snippet parse + featurize.
     pub parse_ms: f64,
+    /// Phase I: inverted-index search (with multiset bounds).
     pub phase1_ms: f64,
+    /// Phase II: bounded re-parse, prune and rerank of the candidates.
     pub phase2_ms: f64,
+    /// Phase III: cluster and intersect.
     pub phase3_ms: f64,
     pub total_ms: f64,
+    /// Phase I candidates re-parsed by the bounded Phase II (at most η1).
+    #[serde(default)]
+    pub parsed: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct Output {
+    /// The reranked candidates Phase III can use: the top η2 of N2 with
+    /// score > τ1 (lower-ranked candidates are never re-parsed).
     pub n2: Vec<Ranked>,
     pub recommendations: Vec<Recommendation>,
     pub timings: Timings,
