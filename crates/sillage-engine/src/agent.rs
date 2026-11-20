@@ -339,18 +339,17 @@ fn file_count<'a>(ms: impl IntoIterator<Item = &'a MethodRecord>) -> usize {
     ms.into_iter().map(|m| (&m.repo, &m.path)).collect::<FxHashSet<_>>().len()
 }
 
+/// `w` occurs in `hay` as a whole word: not preceded or followed by an
+/// identifier character (Unicode alphanumerics, `_`, `$`). UTF-8 safe.
 fn has_word(hay: &str, w: &str) -> bool {
-    let b = hay.as_bytes();
-    let id = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
-    let mut from = 0;
-    while let Some(i) = hay[from..].find(w) {
-        let (s, e) = (from + i, from + i + w.len());
-        if (s == 0 || !id(b[s - 1])) && (e >= b.len() || !id(b[e])) {
-            return true;
-        }
-        from = s + 1;
+    if w.is_empty() {
+        return false;
     }
-    false
+    let id = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    hay.match_indices(w).any(|(s, _)| {
+        let e = s + w.len();
+        hay[..s].chars().next_back().is_none_or(|c| !id(c)) && hay[e..].chars().next().is_none_or(|c| !id(c))
+    })
 }
 
 /// Classifies one line of code as a guard, by language-agnostic idioms.
@@ -603,23 +602,111 @@ impl Engine {
     }
 
     /// [`check_missing_guards`](Self::check_missing_guards) over the new side
-    /// of every hunk of a unified diff whose language is indexed. The hunk's
-    /// own file is excluded from its peers. Only hunks with findings are returned.
+    /// of every hunk of a unified diff whose language is indexed (see
+    /// [`check_missing_guards_in_hunk`](Self::check_missing_guards_in_hunk)).
+    /// Only hunks with findings are returned.
     pub fn check_missing_guards_in_diff(&self, unified_diff: &str, opts: &GuardOptions) -> anyhow::Result<Vec<HunkGuards>> {
         let mut out = Vec::new();
         for hunk in extract_diff_hunks(unified_diff) {
             let Some(lang) = hunk.lang else { continue };
-            if hunk.added.is_empty() || hunk.after_code.trim().is_empty() {
-                continue;
-            }
-            let mut o = opts.clone();
-            o.filter = o.filter.exclude_path(hunk.path.clone());
-            let guards = self.check_missing_guards(lang, &hunk.after_code, &o)?;
+            let guards = self.check_missing_guards_in_hunk(lang, &hunk, opts)?;
             if !guards.is_empty() {
                 out.push(HunkGuards { hunk, guards });
             }
         }
         Ok(out)
+    }
+
+    /// Missing guards for one diff hunk. The hunk's own file is excluded from
+    /// its peers. When the engine has a root and the file on disk holds the
+    /// hunk's new side, the hunk is widened to its enclosing method, so guards
+    /// the method already has outside the hunk are not reported. Only guards
+    /// sharing an identifier with the hunk's added lines are kept (guards
+    /// without identifiers, like `try {`, always are).
+    pub fn check_missing_guards_in_hunk(&self, lang: Lang, hunk: &DiffHunk, opts: &GuardOptions) -> anyhow::Result<Vec<MissingGuard>> {
+        if hunk.added.is_empty() || hunk.after_code.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let code = self.enclosing_method_on_disk(lang, hunk).unwrap_or_else(|| hunk.after_code.clone());
+        let mut o = opts.clone();
+        o.filter = o.filter.exclude_path(hunk.path.clone());
+        let guards = self.check_missing_guards(lang, &code, &o)?;
+        let added: FxHashSet<String> = hunk.added.iter().flat_map(|l| sillage_index::tokenize(&l.text)).collect();
+        Ok(guards
+            .into_iter()
+            .filter(|g| {
+                let ids: Vec<String> = guard_identifiers(&g.head).collect();
+                ids.is_empty() || ids.iter().any(|t| added.contains(t))
+            })
+            .collect())
+    }
+
+    /// The text of the one method of `hunk`'s file (read under the engine's
+    /// root) that contains the hunk's added lines, when the file's content
+    /// matches them. `None` without a root, for paths escaping it, oversized
+    /// files or methods, and when the added lines span several methods.
+    fn enclosing_method_on_disk(&self, lang: Lang, hunk: &DiffHunk) -> Option<String> {
+        const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+        let root = self.root.as_deref()?;
+        let rel = std::path::Path::new(hunk.new_path.as_deref()?);
+        if hunk.is_deleted_file || !rel.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+            return None;
+        }
+        let path = std::fs::canonicalize(root.join(rel)).ok()?;
+        if !path.starts_with(root) || std::fs::metadata(&path).ok()?.len() > MAX_FILE_BYTES {
+            return None;
+        }
+        let src = std::fs::read_to_string(&path).ok()?;
+        let file_lines: Vec<&str> = src.lines().collect();
+        let mut owner: Option<usize> = None;
+        let methods = sillage_parse::extract_methods(lang, &src);
+        let ranges: Vec<(u32, u32)> = methods
+            .iter()
+            .map(|m| {
+                let text = &src[m.text_span.start as usize..m.text_span.end as usize];
+                (m.line_start, m.line_start + text.lines().count().max(1) as u32 - 1)
+            })
+            .collect();
+        for l in hunk.added.iter().filter(|l| !l.text.trim().is_empty()) {
+            let disk = file_lines.get((l.line as usize).checked_sub(1)?)?;
+            if disk.trim_end() != l.text.trim_end() {
+                return None; // the file is not the diff's new side
+            }
+            // Innermost method containing the line.
+            let inner = ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, (a, b))| (*a..=*b).contains(&l.line))
+                .min_by_key(|(_, (a, b))| b - a)
+                .map(|(i, _)| i);
+            match (owner, inner) {
+                (_, None) => {}
+                (None, Some(i)) => owner = Some(i),
+                (Some(o), Some(i)) if o == i => {}
+                _ => return None,
+            }
+        }
+        let m = &methods[owner?];
+        let text = &src[m.text_span.start as usize..m.text_span.end as usize];
+        (text.len() <= MAX_EXPANDED_METHOD_BYTES).then(|| text.to_string())
+    }
+
+    /// The `tests` whose text mentions `name` as a whole word. When the BM25
+    /// index covers the corpus, candidates come from its posting list for
+    /// `name` (bodies only) instead of a full-text scan of every test.
+    fn tests_mentioning<'a>(&self, tests: &[&'a MethodRecord], name: &str) -> Vec<&'a MethodRecord> {
+        let single_token = {
+            let mut it = sillage_index::tokenize(name);
+            it.next().as_deref() == Some(name) && it.next().is_none()
+        };
+        if single_token && self.bm25.num_docs() == self.corpus.methods.len() {
+            let cand: FxHashSet<MethodId> = self.bm25.docs_with_term(name).collect();
+            if cand.is_empty() {
+                return Vec::new();
+            }
+            return tests.iter().copied().filter(|t| cand.contains(&t.id) && has_word(&t.text, name)).collect();
+        }
+        tests.iter().copied().filter(|t| has_word(&t.text, name)).collect()
     }
 
     /// Tests to model a test of `draft` on: tests that call the draft's own
@@ -644,8 +731,10 @@ impl Engine {
             }
         };
         if let Some(name) = d.name.as_deref().filter(|n| distinctive(n)) {
-            for t in tests.iter().filter(|t| &*t.name != name && has_word(&t.text, name)) {
-                offer(t.id, 1.0 + name_bonus(&t.name, name), TestLink::ReferencesDraft, None);
+            for t in self.tests_mentioning(&tests, name) {
+                if &*t.name != name {
+                    offer(t.id, 1.0 + name_bonus(&t.name, name), TestLink::ReferencesDraft, None);
+                }
             }
         }
         for r in &similar {
@@ -654,8 +743,13 @@ impl Engine {
         for p in &peers {
             let Some(pm) = self.method(p.id) else { continue };
             let peer_path = pm.rel_path();
+            let mentions: FxHashSet<MethodId> = if distinctive(&pm.name) {
+                self.tests_mentioning(&tests, &pm.name).into_iter().filter(|t| t.name != pm.name).map(|t| t.id).collect()
+            } else {
+                FxHashSet::default()
+            };
             for t in &tests {
-                if distinctive(&pm.name) && &*t.name != &*pm.name && has_word(&t.text, &pm.name) {
+                if mentions.contains(&t.id) {
                     offer(t.id, p.score * (0.9 + name_bonus(&t.name, &pm.name)), TestLink::ReferencesPeer, Some(p.id));
                 } else if corresponding_test_file(lang, &peer_path, &t.rel_path()) {
                     offer(t.id, 0.6 * p.score, TestLink::CorrespondingFile, Some(p.id));
@@ -676,7 +770,7 @@ impl Engine {
                     (Some(p), Some(name)) if via != TestLink::Similar => {
                         let renamed = sillage_parse::rename_identifiers(t.lang, &code, &p.name, name);
                         // `TestLoadUser` → `TestLoadInvoice` for peer `LoadUser`.
-                        let new_test_name = t.name.replace(&*p.name, name);
+                        let new_test_name = t.name.replacen(&*p.name, name, 1);
                         Some(sillage_parse::rename_identifiers(t.lang, &renamed, &t.name, &new_test_name))
                     }
                     _ => None,
@@ -700,6 +794,33 @@ impl Engine {
             tests,
         })
     }
+}
+
+/// Largest enclosing method a diff hunk is widened to (bytes).
+const MAX_EXPANDED_METHOD_BYTES: usize = 64 * 1024;
+
+/// Identifiers of a guard line, without keywords, literals of common
+/// sentinels and numbers: what ties a guard to the code it protects.
+fn guard_identifiers(head: &str) -> impl Iterator<Item = String> + '_ {
+    const KEYWORDS: &[&str] = &[
+        "if", "else", "elif", "for", "while", "return", "nil", "null", "None", "undefined", "true", "false", "True",
+        "False", "not", "is", "and", "or", "let", "var", "const", "defer", "try", "catch", "except", "finally", "raise",
+        "throw", "throws", "new", "self", "this", "fn", "func", "def", "in", "of", "mut", "Some", "Ok", "Err", "unless",
+        "guard", "with", "as", "await", "async", "go", "match", "case",
+    ];
+    // String literals are not identifiers of the guarded code.
+    let mut code = String::with_capacity(head.len());
+    let mut quote: Option<char> = None;
+    for c in head.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if matches!(c, '"' | '\'' | '`') => quote = Some(c),
+            None => code.push(c),
+        }
+    }
+    sillage_index::tokenize_owned(code)
+        .filter(|t| !KEYWORDS.contains(&t.as_str()) && !t.bytes().all(|b| b.is_ascii_digit()))
 }
 
 const ASSERT_MARKS: &[&str] = &[
@@ -731,6 +852,9 @@ fn name_bonus(test_name: &str, fname: &str) -> f64 {
     if norm(test_name).contains(&norm(fname)) { 0.1 } else { 0.0 }
 }
 
+/// File stems too generic to pair a test with across unrelated directories.
+const GENERIC_STEMS: &[&str] = &["mod", "lib", "main", "index", "__init__"];
+
 /// Whether `test_path` is the conventional test file for `prod_path`.
 fn corresponding_test_file(lang: Lang, prod_path: &str, test_path: &str) -> bool {
     if prod_path == test_path {
@@ -741,8 +865,21 @@ fn corresponding_test_file(lang: Lang, prod_path: &str, test_path: &str) -> bool
         let (stem, ext) = file.split_once('.').unwrap_or((file, ""));
         (dir.to_string(), stem.to_string(), ext.to_string())
     };
-    let (pdir, pstem, _) = split(prod_path);
+    let (pdir, mut pstem, _) = split(prod_path);
     let (tdir, tstem, text) = split(test_path);
+    if GENERIC_STEMS.contains(&pstem.as_str()) {
+        let parent = |d: &str| d.rsplit_once('/').map_or("", |(p, _)| p).to_string();
+        let near = tdir == pdir || (tdir.ends_with("__tests__") && parent(&tdir) == pdir);
+        if !near {
+            // `store/mod.rs`, `store/__init__.py`, `store/index.ts` stand for `store`.
+            let dname = pdir.rsplit('/').next().unwrap_or("");
+            let named_by_dir = matches!(pstem.as_str(), "mod" | "__init__" | "index");
+            if !named_by_dir || dname.is_empty() || dname == "src" || GENERIC_STEMS.contains(&dname) {
+                return false;
+            }
+            pstem = dname.to_string();
+        }
+    }
     match lang {
         Lang::Go => tdir == pdir && tstem == format!("{pstem}_test"),
         Lang::Rust => {
@@ -827,5 +964,34 @@ mod tests {
         assert!(corresponding_test_file(Lang::Rust, "src/store.rs", "tests/store.rs"));
         assert!(!corresponding_test_file(Lang::Python, "app/store.py", "tests/test_other.py"));
         assert!(distinctive("parse_config") && !distinctive("new") && !distinctive("get"));
+        // M6: generic stems never pair across unrelated directories.
+        assert!(!corresponding_test_file(Lang::Rust, "a/mod.rs", "b/mod.rs"));
+        assert!(!corresponding_test_file(Lang::Rust, "x/src/lib.rs", "y/tests/lib.rs"));
+        assert!(!corresponding_test_file(Lang::Python, "pkg/a/__init__.py", "tests/test___init__.py"));
+        assert!(!corresponding_test_file(Lang::TypeScript, "a/index.ts", "b/index.test.ts"));
+        assert!(corresponding_test_file(Lang::TypeScript, "a/index.ts", "a/index.test.ts"));
+        assert!(corresponding_test_file(Lang::TypeScript, "a/index.ts", "a/__tests__/index.ts"));
+        assert!(corresponding_test_file(Lang::Rust, "src/store/mod.rs", "tests/store.rs"));
+        assert!(corresponding_test_file(Lang::Python, "pkg/store/__init__.py", "tests/test_store.py"));
+    }
+
+    #[test]
+    fn guard_identifier_extraction() {
+        let ids = |h: &str| guard_identifiers(h).collect::<Vec<_>>();
+        assert_eq!(ids("if err != nil {"), ["err"]);
+        assert_eq!(ids("defer res.Close()"), ["res", "Close"]);
+        assert_eq!(ids("log.Printf(\"loaded %d\", n)"), ["log", "Printf", "n"]);
+        assert!(ids("try {").is_empty() && ids("if x == 0 {") == ["x"]);
+    }
+
+    #[test]
+    fn has_word_is_utf8_safe() {
+        assert!(!has_word("xéval_config(1)", "éval_config"));
+        assert!(has_word("let a = éval_config(1);", "éval_config"));
+        assert!(!has_word("ééval_config()", "éval_config"));
+        assert!(has_word("ü + éval_config", "éval_config"));
+        assert!(!has_word("aé", "é"));
+        assert!(!has_word("anything", ""));
+        assert!(has_word("load(x)", "load") && !has_word("reload(x)", "load") && !has_word("load_all()", "load"));
     }
 }

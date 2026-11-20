@@ -39,19 +39,22 @@ pub fn shorthand_spans(lang: Lang, text: &str) -> Vec<(u32, u32)> {
     best.unwrap_or_default()
 }
 
-fn collect(n: Node<'_>, kinds: &[&str], offset: usize, len: usize, out: &mut Vec<(u32, u32)>) {
-    if kinds.contains(&n.kind()) {
-        // `shorthand_field_initializer` wraps the identifier; use the leaf span.
-        let leaf = if n.child_count() == 1 { n.child(0).unwrap_or(n) } else { n };
-        let (s, e) = (leaf.start_byte(), leaf.end_byte());
-        if s >= offset && e <= offset + len {
-            out.push(((s - offset) as u32, (e - offset) as u32));
+fn collect(root: Node<'_>, kinds: &[&str], offset: usize, len: usize, out: &mut Vec<(u32, u32)>) {
+    // Explicit stack: deeply nested literals must not overflow the call stack.
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if kinds.contains(&n.kind()) {
+            // `shorthand_field_initializer` wraps the identifier; use the leaf span.
+            let leaf = if n.child_count() == 1 { n.child(0).unwrap_or(n) } else { n };
+            let (s, e) = (leaf.start_byte(), leaf.end_byte());
+            if s >= offset && e <= offset + len {
+                out.push(((s - offset) as u32, (e - offset) as u32));
+            }
+            continue;
         }
-        return;
-    }
-    let mut cur = n.walk();
-    for c in n.children(&mut cur) {
-        collect(c, kinds, offset, len, out);
+        let mut cur = n.walk();
+        let children: Vec<Node<'_>> = n.children(&mut cur).collect();
+        stack.extend(children.into_iter().rev());
     }
 }
 

@@ -523,54 +523,55 @@ fn analyze(lang: Lang, stmt: &str) -> Option<Analyzed> {
 }
 
 /// Names bound by a Rust use tree; returns `true` when it contains a wildcard.
-fn rust_bindings(n: Node<'_>, src: &str, parent_path: &str, out: &mut Vec<String>) -> bool {
+/// Iterative (explicit stack) so pathological nesting cannot overflow the stack.
+fn rust_bindings(root: Node<'_>, src: &str, root_path: &str, out: &mut Vec<String>) -> bool {
     let t = |n: Node<'_>| text(n, src).to_string();
-    match n.kind() {
-        "identifier" | "type_identifier" => {
-            out.push(t(n));
-            false
-        }
-        "self" => {
-            let last = last_segment(parent_path, ':');
-            if !last.is_empty() {
-                out.push(last);
-            }
-            false
-        }
-        "scoped_identifier" => {
-            if let Some(name) = n.child_by_field_name("name") {
-                if name.kind() == "self" {
-                    let p = n.child_by_field_name("path").map(t).unwrap_or_default();
-                    out.push(last_segment(&p, ':'));
-                } else {
-                    out.push(t(name));
+    let mut wild = false;
+    // (node, parent path); children pushed in reverse to keep source order.
+    let mut stack: Vec<(Node<'_>, String)> = vec![(root, root_path.to_string())];
+    while let Some((n, parent_path)) = stack.pop() {
+        match n.kind() {
+            "identifier" | "type_identifier" => out.push(t(n)),
+            "self" => {
+                let last = last_segment(&parent_path, ':');
+                if !last.is_empty() {
+                    out.push(last);
                 }
             }
-            false
-        }
-        "use_as_clause" => {
-            if let Some(a) = n.child_by_field_name("alias") {
-                out.push(t(a));
-            }
-            false
-        }
-        "use_wildcard" => true,
-        "scoped_use_list" => {
-            let p = n.child_by_field_name("path").map(t).unwrap_or_default();
-            let full = if parent_path.is_empty() { p } else { format!("{parent_path}::{p}") };
-            n.child_by_field_name("list").is_some_and(|l| rust_bindings(l, src, &full, out))
-        }
-        "use_list" => {
-            let mut wild = false;
-            for i in 0..n.named_child_count() {
-                if let Some(c) = n.named_child(i) {
-                    wild |= rust_bindings(c, src, parent_path, out);
+            "scoped_identifier" => {
+                if let Some(name) = n.child_by_field_name("name") {
+                    if name.kind() == "self" {
+                        let p = n.child_by_field_name("path").map(t).unwrap_or_default();
+                        out.push(last_segment(&p, ':'));
+                    } else {
+                        out.push(t(name));
+                    }
                 }
             }
-            wild
+            "use_as_clause" => {
+                if let Some(a) = n.child_by_field_name("alias") {
+                    out.push(t(a));
+                }
+            }
+            "use_wildcard" => wild = true,
+            "scoped_use_list" => {
+                let p = n.child_by_field_name("path").map(t).unwrap_or_default();
+                let full = if parent_path.is_empty() { p } else { format!("{parent_path}::{p}") };
+                if let Some(l) = n.child_by_field_name("list") {
+                    stack.push((l, full));
+                }
+            }
+            "use_list" => {
+                for i in (0..n.named_child_count()).rev() {
+                    if let Some(c) = n.named_child(i) {
+                        stack.push((c, parent_path.clone()));
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => false,
     }
+    wild
 }
 
 /// Candidate package names of a Go import path: the last segment, without a
@@ -618,20 +619,23 @@ fn is_require_decl(node: Node<'_>, src: &str) -> bool {
     })
 }
 
-fn collect_kinds(n: Node<'_>, src: &str, kinds: &[&str], out: &mut Vec<String>) {
-    if kinds.contains(&n.kind()) {
-        out.push(text(n, src).to_string());
-        return;
-    }
-    if n.kind() == "pair_pattern" {
-        if let Some(v) = n.child_by_field_name("value") {
-            collect_kinds(v, src, kinds, out);
+fn collect_kinds(root: Node<'_>, src: &str, kinds: &[&str], out: &mut Vec<String>) {
+    // Explicit stack (source order kept) so deep patterns cannot overflow.
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if kinds.contains(&n.kind()) {
+            out.push(text(n, src).to_string());
+            continue;
         }
-        return;
-    }
-    let mut cur = n.walk();
-    for c in n.named_children(&mut cur) {
-        collect_kinds(c, src, kinds, out);
+        if n.kind() == "pair_pattern" {
+            if let Some(v) = n.child_by_field_name("value") {
+                stack.push(v);
+            }
+            continue;
+        }
+        let mut cur = n.walk();
+        let children: Vec<Node<'_>> = n.named_children(&mut cur).collect();
+        stack.extend(children.into_iter().rev());
     }
 }
 

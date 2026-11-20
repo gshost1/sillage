@@ -5,7 +5,8 @@
 //! values) are JSON-RPC `-32602` errors; semantic problems the agent can fix
 //! (unknown language or corpus, oversized input, neither `code` nor `diff`)
 //! are tool results with `isError: true`. Engine work runs on the blocking
-//! pool, never on the async runtime's worker threads.
+//! pool, never on the async runtime's worker threads, behind the dispatcher's
+//! [`ToolLimits`] (a global concurrency cap and a per-call timeout).
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -18,8 +19,8 @@ use sillage_engine::{
     Citation, DiffHunk, GuardOptions, IdiomOptions, MissingGuard, QueryFilter, TestIdiomOptions, extract_diff_hunks,
 };
 
-use crate::protocol::{INTERNAL_ERROR, RpcError};
-use crate::registry::{CorpusHandle, CorpusRegistry, SourceKind};
+use crate::protocol::{INTERNAL_ERROR, RpcError, ToolLimits};
+use crate::registry::{CorpusHandle, CorpusRegistry, RefreshInProgress, SourceKind};
 
 /// Largest `snippet` / `code` accepted (bytes).
 pub const MAX_SNIPPET_BYTES: usize = 64 * 1024;
@@ -40,6 +41,9 @@ const MAX_CITES: usize = 5;
 const SIMILAR_LINES: usize = 30;
 /// Lines shown per test in `find_test_idioms` by default.
 const TEST_LINES: usize = 40;
+/// `find_similar_code` matches scoring below this are not shown (the same
+/// floor `find_test_idioms` applies to its peers), so junk queries stay silent.
+pub const MIN_SIMILAR_SCORE: f64 = 0.4;
 
 /// A tool's text result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +69,7 @@ const LANGS: &str = "java, python, javascript, typescript, tsx, go, rust";
 pub fn tool_definitions() -> Value {
     let corpus = json!({ "type": "string", "description": "Corpus name (default: the server's default corpus; see corpus_status)." });
     let lang = json!({ "type": "string", "enum": ["java", "python", "javascript", "typescript", "tsx", "go", "rust"], "description": "Language of the code." });
-    let exclude = json!({ "type": "string", "description": "Repo-relative (or absolute) file to exclude, usually the file you are editing; a trailing `/` excludes a directory." });
+    let exclude = json!({ "type": "string", "description": "Repo-relative (or absolute) file to exclude, usually the file you are editing; a trailing `/` excludes a directory. Either a single path string or an array of path strings (up to 32) is accepted." });
     json!([
         {
             "name": "find_idioms",
@@ -262,8 +266,16 @@ fn parse_args<T: serde::de::DeserializeOwned>(tool: &str, args: Value) -> Result
     serde_json::from_value(args).map_err(|e| RpcError::invalid_params(format!("{tool}: invalid arguments: {e}")))
 }
 
-/// Dispatches `tools/call`; unknown tools are `-32602`.
-pub async fn call_tool(registry: &Arc<CorpusRegistry>, name: &str, args: Value) -> Result<ToolOutput, RpcError> {
+/// Dispatches `tools/call`; unknown tools are `-32602`. The call waits for a
+/// permit of `limits` and must finish within `limits.timeout` (else an
+/// `isError` result). The permit stays held until the blocking job ends, so
+/// timed-out work still counts against the cap.
+pub async fn call_tool(
+    registry: &Arc<CorpusRegistry>,
+    limits: &ToolLimits,
+    name: &str,
+    args: Value,
+) -> Result<ToolOutput, RpcError> {
     let reg = Arc::clone(registry);
     let job: Box<dyn FnOnce() -> ToolResult + Send> = match name {
         "find_idioms" => {
@@ -292,10 +304,28 @@ pub async fn call_tool(registry: &Arc<CorpusRegistry>, name: &str, args: Value) 
         }
         other => return Err(RpcError::invalid_params(format!("unknown tool: {other}"))),
     };
-    match tokio::task::spawn_blocking(job).await {
-        Ok(Ok(text)) => Ok(ToolOutput::ok(text)),
-        Ok(Err(text)) => Ok(ToolOutput::err(text)),
-        Err(e) => Err(RpcError::new(INTERNAL_ERROR, format!("{name} failed: {e}"))),
+    let timeout = limits.timeout;
+    let timed_out = || {
+        ToolOutput::err(format!(
+            "{name} timed out after {:.1}s (server busy or input too large); retry with a smaller input",
+            timeout.as_secs_f64()
+        ))
+    };
+    let permits = Arc::clone(&limits.permits);
+    let run = async move {
+        let permit = permits.acquire_owned().await.map_err(|_| RpcError::new(INTERNAL_ERROR, "server is shutting down"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            job()
+        })
+        .await
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, format!("{name} failed: {e}")))
+    };
+    match tokio::time::timeout(timeout, run).await {
+        Err(_) => Ok(timed_out()),
+        Ok(Err(e)) => Err(e),
+        Ok(Ok(Ok(text))) => Ok(ToolOutput::ok(text)),
+        Ok(Ok(Err(text))) => Ok(ToolOutput::err(text)),
     }
 }
 
@@ -458,7 +488,7 @@ fn find_similar(reg: &CorpusRegistry, a: FindSimilarArgs) -> ToolResult {
     let h = corpus(reg, a.corpus.as_deref())?;
     let filter = QueryFilter::new().with_scope(scope).exclude_paths(excl);
     let matches = h.engine().find_similar(lang, &a.snippet, limit, &filter).map_err(|e| format!("{e:#}"))?;
-    let matches: Vec<_> = matches.into_iter().filter(|m| m.score > 0.0).collect();
+    let matches: Vec<_> = matches.into_iter().filter(|m| m.score >= MIN_SIMILAR_SCORE).collect();
     if matches.is_empty() {
         return Ok(format!("No structurally similar {lang} code in corpus `{}` (scope {scope}).", h.name()));
     }
@@ -537,15 +567,18 @@ fn check_guards(reg: &CorpusRegistry, a: GuardArgs) -> ToolResult {
             let mut sections = Vec::new();
             let mut analyzed = 0usize;
             let mut found = 0usize;
+            let mut oversized = 0usize;
             for hunk in hunks.into_iter().filter(|h| !h.added.is_empty() && !h.after_code.trim().is_empty()) {
                 let Some(hl) = hunk.lang.or(lang) else { continue };
+                if hunk.after_code.len() > MAX_SNIPPET_BYTES {
+                    oversized += 1; // the per-snippet cap applies to every hunk
+                    continue;
+                }
                 if analyzed == MAX_DIFF_HUNKS {
                     break;
                 }
                 analyzed += 1;
-                let mut o = base.clone();
-                o.filter = o.filter.exclude_path(hunk.path.clone());
-                let guards = engine.check_missing_guards(hl, &hunk.after_code, &o).map_err(|e| format!("{e:#}"))?;
+                let guards = engine.check_missing_guards_in_hunk(hl, &hunk, &base).map_err(|e| format!("{e:#}"))?;
                 if guards.is_empty() {
                     continue;
                 }
@@ -561,11 +594,18 @@ fn check_guards(reg: &CorpusRegistry, a: GuardArgs) -> ToolResult {
                 render_guards(&mut s, &guards, hl);
                 sections.push(s);
             }
-            let capped = if analyzed == MAX_DIFF_HUNKS && total > MAX_DIFF_HUNKS {
+            let mut capped = if analyzed == MAX_DIFF_HUNKS && total > MAX_DIFF_HUNKS {
                 format!(" (analyzed the first {MAX_DIFF_HUNKS} of {total} hunks)")
             } else {
                 String::new()
             };
+            if oversized > 0 {
+                let _ = write!(
+                    capped,
+                    " (skipped {} over the {MAX_SNIPPET_BYTES}-byte limit)",
+                    plural(oversized, "hunk", "hunks")
+                );
+            }
             if sections.is_empty() {
                 return Ok(format!("{CLEAN}{capped}"));
             }
@@ -691,6 +731,10 @@ fn refresh_line(name: &str, s: &sillage_index::RefreshStats) -> String {
     )
 }
 
+fn in_progress_line(name: &str) -> String {
+    format!("- `{name}`: refresh already in progress; its result will be visible to the next query (check corpus_status)")
+}
+
 fn refresh_corpus(reg: &CorpusRegistry, a: CorpusArgs) -> ToolResult {
     match a.corpus.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
         Some(name) => {
@@ -701,11 +745,14 @@ fn refresh_corpus(reg: &CorpusRegistry, a: CorpusArgs) -> ToolResult {
                     h.name()
                 ));
             }
-            let s = h.refresh().map_err(|e| format!("{e:#}"))?;
-            Ok(format!("Refreshed:\n{}", refresh_line(h.name(), &s)))
+            match h.refresh() {
+                Ok(s) => Ok(format!("Refreshed:\n{}", refresh_line(h.name(), &s))),
+                Err(e) if e.is::<RefreshInProgress>() => Ok(in_progress_line(h.name())),
+                Err(e) => Err(format!("{e:#}")),
+            }
         }
         None => {
-            let results = reg.refresh_all();
+            let results = reg.refresh_all(&|| false);
             if results.is_empty() {
                 return Ok("No directory corpora to refresh (all loaded corpora are static .sil snapshots).".into());
             }
@@ -714,6 +761,7 @@ fn refresh_corpus(reg: &CorpusRegistry, a: CorpusArgs) -> ToolResult {
             for (name, r) in results {
                 match r {
                     Ok(s) => out.push_str(&refresh_line(&name, &s)),
+                    Err(e) if e.is::<RefreshInProgress>() => out.push_str(&in_progress_line(&name)),
                     Err(e) => {
                         failed = true;
                         let _ = write!(out, "- `{name}`: refresh failed: {e:#}");
@@ -760,6 +808,10 @@ mod tests {
         for t in defs.as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object");
             assert!(t["description"].as_str().unwrap().len() > 40);
+            if let Some(e) = t["inputSchema"]["properties"].get("exclude_path") {
+                assert_eq!(e["type"], "string");
+                assert!(e["description"].as_str().unwrap().contains("array of path strings"));
+            }
         }
     }
 

@@ -16,6 +16,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/gshost1/sillage"
+rust-version = "1.90"
 description = "Clean-room Rust remake of Aroma (OOPSLA'19): structural code search and cluster-and-intersect code recommendation"
 
 [workspace.dependencies]
@@ -58,6 +59,9 @@ thiserror = "2.0"
 # MCP server
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-std", "io-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+hyper = { version = "1.6", features = ["http1", "server"] }
+hyper-util = { version = "0.1.10", features = ["tokio", "server", "service"] }
+sha2 = { version = "0.11", default-features = false }
 http-body-util = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 subtle = "2.6"

@@ -123,6 +123,15 @@ async fn body_limit_content_type_and_malformed_json() {
 
     let r = http(srv.addr, "POST", "/mcp", &[("Content-Type", "text/plain")], Some(b"{}")).await;
     assert_eq!(r.status, 415);
+    // The media type is parsed, not substring-matched.
+    let r = http(srv.addr, "POST", "/mcp", &[("Content-Type", "text/plain; x=application/json")], Some(b"{}")).await;
+    assert_eq!(r.status, 415);
+    let r = http(srv.addr, "POST", "/mcp", &[("Content-Type", "Application/JSON; charset=utf-8")], Some(br#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#)).await;
+    assert_eq!(r.status, 200);
+    // An invalid single message echoes its (valid) id.
+    let r = http(srv.addr, "POST", "/mcp", &json_h, Some(br#"{"jsonrpc":"1.0","id":7,"method":"ping"}"#)).await;
+    assert_eq!(r.status, 400);
+    assert_eq!((r.json()["id"].clone(), r.json()["error"]["code"].clone()), (json!(7), json!(-32600)));
     let r = http(srv.addr, "POST", "/mcp", &json_h, Some(b"{not json")).await;
     assert_eq!(r.status, 400);
     assert_eq!(r.json()["error"]["code"], -32700);
@@ -130,6 +139,15 @@ async fn body_limit_content_type_and_malformed_json() {
     assert_eq!(r.status, 400);
     assert_eq!(r.json()["error"]["code"], -32600);
     let r = http(srv.addr, "POST", "/mcp", &[("Content-Type", "application/json"), ("Mcp-Protocol-Version", "1999-01-01")], Some(b"{}")).await;
+    assert_eq!(r.status, 400);
+    let r = http(srv.addr, "POST", "/mcp", &[("Content-Type", "application/json"), ("Mcp-Protocol-Version", "1999-01-01")], Some(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)).await;
+    assert_eq!(r.status, 400, "non-initialize requests must declare a supported version");
+    // `initialize` negotiates, so an unknown header version does not block it.
+    let init = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2030-01-01"}}"#;
+    let r = http(srv.addr, "POST", "/mcp", &[("Content-Type", "application/json"), ("Mcp-Protocol-Version", "2030-01-01")], Some(init)).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.json()["result"]["protocolVersion"], "2025-06-18");
+    let r = http(srv.addr, "DELETE", "/mcp", &[("Mcp-Protocol-Version", "1999-01-01"), ("Mcp-Session-Id", "x")], None).await;
     assert_eq!(r.status, 400);
     srv.stop().await;
 }
@@ -153,10 +171,12 @@ async fn full_mcp_lifecycle_with_sessions_and_sse() {
     let sid = c.session.clone().expect("Mcp-Session-Id issued");
     assert_eq!(sid.len(), 32);
     assert!(sid.bytes().all(|b| b.is_ascii_hexdigit()));
-    // Unknown versions fall back to 2025-03-26.
+    // Unknown (future) versions negotiate the latest supported one.
     let old = Client::new(srv.addr).with_token(TOKEN).rpc(1, "initialize", json!({ "protocolVersion": "2030-01-01" })).await;
-    assert_eq!(old.json()["result"]["protocolVersion"], "2025-03-26");
+    assert_eq!(old.json()["result"]["protocolVersion"], "2025-06-18");
     assert_ne!(old.header("mcp-session-id"), Some(sid.as_str()));
+    let v2024 = Client::new(srv.addr).with_token(TOKEN).rpc(1, "initialize", json!({ "protocolVersion": "2024-11-05" })).await;
+    assert_eq!(v2024.json()["result"]["protocolVersion"], "2024-11-05");
 
     let note = c.post(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
     assert_eq!(note.status, 202);
@@ -183,30 +203,54 @@ async fn full_mcp_lifecycle_with_sessions_and_sse() {
     assert_eq!(e["error"]["code"], -32601);
     let e = c.rpc(4, "tools/call", json!({ "name": "nope", "arguments": {} })).await.json();
     assert_eq!(e["error"]["code"], -32602);
-    // Batches work (2025-03-26); notifications inside yield no entry.
-    let b = c
-        .post(&json!([
-            { "jsonrpc": "2.0", "id": 10, "method": "ping" },
-            { "jsonrpc": "2.0", "method": "notifications/progress" },
-            { "jsonrpc": "2.0", "id": 11, "method": "ping" }
-        ]))
-        .await
-        .json();
-    assert_eq!(b.as_array().unwrap().len(), 2);
+    // Batches work on 2025-03-26 sessions and stateless calls; notifications
+    // inside yield no entry. 2025-06-18 removed batching: rejected there.
+    let batch = json!([
+        { "jsonrpc": "2.0", "id": 10, "method": "ping" },
+        { "jsonrpc": "2.0", "method": "notifications/progress" },
+        { "jsonrpc": "2.0", "id": 11, "method": "ping" }
+    ]);
+    let mut c25 = Client::new(srv.addr).with_token(TOKEN);
+    let init25 = c25.rpc(1, "initialize", json!({ "protocolVersion": "2025-03-26" })).await;
+    c25.session = init25.header("mcp-session-id").map(str::to_string);
+    assert!(c25.session.is_some());
+    assert_eq!(c25.post(&batch).await.json().as_array().unwrap().len(), 2);
+    assert_eq!(Client::new(srv.addr).with_token(TOKEN).post(&batch).await.json().as_array().unwrap().len(), 2, "stateless");
+    let r = c.post(&batch).await;
+    assert_eq!(r.status, 400, "{r:?}");
+    assert_eq!(r.json()["error"]["code"], -32600);
+    assert!(r.json()["error"]["message"].as_str().unwrap().contains("2025-06-18"));
+    let auth = format!("Bearer {TOKEN}");
+    let r = http(
+        srv.addr,
+        "POST",
+        "/mcp",
+        &[("Authorization", &auth), ("Content-Type", "application/json"), ("Mcp-Protocol-Version", "2025-06-18")],
+        Some(batch.to_string().as_bytes()),
+    )
+    .await;
+    assert_eq!(r.status, 400, "declared 2025-06-18: no batches");
+    // Oversized batches are rejected whatever the version.
+    let big: Vec<_> = (0..33).map(|i| json!({ "jsonrpc": "2.0", "id": i, "method": "ping" })).collect();
+    let r = Client::new(srv.addr).with_token(TOKEN).post(&json!(big)).await.json();
+    assert_eq!(r["error"]["code"], -32600, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("limit of 32"), "{r}");
 
     // Stateless calls (no session header) are served too.
     let stateless = Client::new(srv.addr).with_token(TOKEN);
     assert!(stateless.ok("corpus_status", json!({})).await.contains("`app`"));
 
-    // GET /mcp: needs the SSE Accept type; opens a stream bound to the session.
-    let auth = format!("Bearer {TOKEN}");
+    // GET /mcp: needs the SSE Accept type and a session; opens a stream bound to it.
     let r = http(srv.addr, "GET", "/mcp", &[("Authorization", &auth), ("Accept", "application/json")], None).await;
     assert_eq!(r.status, 406);
     let r = http(srv.addr, "GET", "/mcp", &[("Authorization", &auth), ("Accept", "text/event-stream"), ("Mcp-Session-Id", "0000")], None).await;
     assert_eq!(r.status, 404);
+    let r = http(srv.addr, "GET", "/mcp", &[("Authorization", &auth), ("Accept", "text/event-stream")], None).await;
+    assert_eq!(r.status, 400, "GET /mcp without a session");
+    assert!(r.body.contains("Mcp-Session-Id"), "{r:?}");
     let mut sse = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
     sse.write_all(
-        format!("GET /mcp HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: {auth}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {sid}\r\n\r\n").as_bytes(),
+        format!("GET /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: {auth}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {sid}\r\n\r\n").as_bytes(),
     )
     .await
     .unwrap();
@@ -236,8 +280,9 @@ async fn full_mcp_lifecycle_with_sessions_and_sse() {
     // An open stream does not block graceful shutdown.
     let mut c2 = Client::new(srv.addr).with_token(TOKEN);
     c2.initialize().await;
+    let sid2 = c2.session.clone().unwrap();
     let mut sse2 = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
-    sse2.write_all(format!("GET /mcp HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: {auth}\r\nAccept: text/event-stream\r\n\r\n").as_bytes()).await.unwrap();
+    sse2.write_all(format!("GET /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: {auth}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {sid2}\r\n\r\n").as_bytes()).await.unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(5), sse2.read(&mut buf)).await.unwrap().unwrap();
     srv.stop().await;
     let mut tail = Vec::new();
@@ -303,6 +348,11 @@ async fn agent_tools_over_http() {
     assert!(one.starts_with("1 similar method"), "{one}");
     let capped = c.ok("find_similar_code", json!({ "snippet": DRAFT_BODY, "lang": "go", "limit": 1000 })).await;
     assert!(capped.matches("\n```go\n").count() <= 20);
+    // Junk queries stay silent instead of listing weak matches.
+    for junk in ["x := 1", "zz.Qux(7)", "return"] {
+        let j = c.ok("find_similar_code", json!({ "snippet": junk, "lang": "go" })).await;
+        assert!(j.starts_with("No structurally similar go code"), "{junk}: {j}");
+    }
 
     // check_missing_guards with code + lang.
     let g = c.ok("check_missing_guards", json!({ "code": DRAFT_MISSING, "lang": "go" })).await;
@@ -463,4 +513,144 @@ async fn background_refresh_picks_up_changes() {
     }
     shutdown.trigger();
     tokio::time::timeout(Duration::from_secs(5), task).await.expect("refresh task stops on shutdown").unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_header_is_checked_on_loopback() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = registry(vec![go_corpus(dir.path(), "app")], None);
+    let srv = TestServer::start(reg, HttpConfig { allowed_hosts: vec!["mcp.internal".into()], ..HttpConfig::default() }).await;
+    let ping = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let post = |host: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            ping.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        s.write_all(ping).await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await.unwrap().unwrap();
+        String::from_utf8_lossy(&out).split(' ').nth(1).unwrap_or("").to_string()
+    };
+    assert_eq!(post("evil.example").await, "403", "DNS-rebinding Host refused");
+    assert_eq!(post("evil.example:8765").await, "403");
+    assert_eq!(post("localhost:8765").await, "200");
+    assert_eq!(post("[::1]:8765").await, "200");
+    assert_eq!(post("mcp.internal").await, "200", "--allow-host");
+    // /healthz stays open for probes.
+    let mut s = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    s.write_all(b"GET /healthz HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 200"));
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_clients_time_out_and_shutdown_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = registry(vec![go_corpus(dir.path(), "app")], None);
+    let cfg = HttpConfig {
+        header_read_timeout: Duration::from_millis(300),
+        request_timeout: Duration::from_millis(300),
+        shutdown_timeout: Duration::from_millis(300),
+        ..HttpConfig::default()
+    };
+    let srv = TestServer::start(reg, cfg).await;
+    let read_all = |mut s: tokio::net::TcpStream| async move {
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await.expect("server closes the connection").ok();
+        String::from_utf8_lossy(&out).to_string()
+    };
+
+    // A body that never arrives: 408 once the body timeout passes.
+    let t0 = std::time::Instant::now();
+    let mut s = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    s.write_all(b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"jsonrpc\"").await.unwrap();
+    let out = read_all(s).await;
+    assert!(out.starts_with("HTTP/1.1 408"), "{out}");
+    assert!(t0.elapsed() < Duration::from_secs(3));
+
+    // Headers that never finish, and an idle connection: closed by the server.
+    let mut s = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    s.write_all(b"POST /mcp HTTP/1.1\r\nHost: local").await.unwrap();
+    read_all(s).await;
+    let idle = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    read_all(idle).await;
+    assert!(t0.elapsed() < Duration::from_secs(5));
+
+    // Health stays reachable meanwhile.
+    assert_eq!(http(srv.addr, "GET", "/healthz", &[], None).await.status, 200);
+
+    // A client stalled mid-body at shutdown cannot hold the server open.
+    let mut stalled = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    stalled.write_all(b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let t1 = std::time::Instant::now();
+    srv.stop().await;
+    assert!(t1.elapsed() < Duration::from_secs(2), "shutdown took {:?}", t1.elapsed());
+    drop(stalled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_cap_sheds_excess_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = registry(vec![go_corpus(dir.path(), "app")], None);
+    let srv = TestServer::start(reg, HttpConfig { max_connections: 2, header_read_timeout: Duration::from_secs(30), ..HttpConfig::default() }).await;
+    let _a = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    let _b = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The third is closed at once instead of queueing behind the idle two.
+    let mut c = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    let _ = c.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+    let mut out = Vec::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut out)).await.expect("shed promptly");
+    assert!(n.is_err() || out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+    drop((_a, _b));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(http(srv.addr, "GET", "/healthz", &[], None).await.status, 200, "slots free again");
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_calls_time_out_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = registry(vec![go_corpus(dir.path(), "app")], None);
+    let limits = sillage_mcp::ToolLimits::new(1, Duration::ZERO);
+    let srv = TestServer::start_with(reg, HttpConfig::default(), limits).await;
+    let c = Client::new(srv.addr);
+    let (t, err) = c.tool("find_similar_code", json!({ "snippet": DRAFT_BODY, "lang": "go" })).await;
+    assert!(err && t.contains("timed out"), "{t}");
+    // Non-tool requests are unaffected.
+    assert_eq!(c.rpc(2, "ping", json!({})).await.status, 200);
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sse_keep_alives_refresh_the_session_and_streams_are_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = registry(vec![go_corpus(dir.path(), "app")], None);
+    let cfg = HttpConfig {
+        session_ttl: Duration::from_millis(400),
+        keep_alive: Duration::from_millis(50),
+        max_stream_lifetime: Duration::from_millis(900),
+        ..HttpConfig::default()
+    };
+    let srv = TestServer::start(reg, cfg).await;
+    let mut c = Client::new(srv.addr);
+    c.initialize().await;
+    let sid = c.session.clone().unwrap();
+    let t0 = std::time::Instant::now();
+    let mut sse = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+    sse.write_all(format!("GET /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: text/event-stream\r\nMcp-Session-Id: {sid}\r\n\r\n").as_bytes()).await.unwrap();
+    // Past the idle TTL: only the stream's keep-alives kept the session alive.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(c.rpc(2, "ping", json!({})).await.status, 200, "session refreshed by keep-alives");
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sse.read_to_end(&mut out)).await.expect("stream lifetime capped").unwrap();
+    assert!(t0.elapsed() >= Duration::from_millis(850), "{:?}", t0.elapsed());
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("sillage stream open") && text.contains("keep-alive"), "{text}");
+    srv.stop().await;
 }

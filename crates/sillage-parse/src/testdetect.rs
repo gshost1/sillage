@@ -200,6 +200,9 @@ fn is_ident_byte(b: u8) -> bool {
 
 /// `word` occurs in `s` not preceded or followed by an identifier character.
 fn has_word(s: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
     let b = s.as_bytes();
     let mut from = 0;
     while let Some(i) = s[from..].find(word) {
@@ -210,19 +213,28 @@ fn has_word(s: &str, word: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = start + 1;
+        from = start + first_char_len(word);
     }
     false
 }
 
+/// Byte length of `s`'s first char: the step from one match to the next
+/// search start that stays on a UTF-8 boundary.
+fn first_char_len(s: &str) -> usize {
+    s.chars().next().map_or(1, char::len_utf8)
+}
+
 /// `name(` (optionally `name.x(`) called as a free function: not `.name(`.
 fn has_call(s: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
     let b = s.as_bytes();
     let mut from = 0;
     while let Some(i) = s[from..].find(name) {
         let start = from + i;
         let end = start + name.len();
-        from = start + 1;
+        from = start + first_char_len(name);
         if start > 0 && (is_ident_byte(b[start - 1]) || b[start - 1] == b'.') {
             continue;
         }
@@ -253,6 +265,15 @@ mod tests {
         assert!(has_call("describe.each([1])('x', f)", "describe"));
         assert!(!has_call("/x/.test(s)", "test"));
         assert!(!has_call("submit(1)", "it"));
+    }
+
+    #[test]
+    fn utf8_safe_scanning() {
+        assert!(!has_word("xéval_config(1)", "éval_config"));
+        assert!(has_word("(éval_config)", "éval_config"));
+        assert!(!has_call("xéval_config(1)", "éval_config"));
+        assert!(has_call("éval_config(1)", "éval_config"));
+        assert!(!has_word("abc", "") && !has_call("abc", ""));
     }
 
     #[test]

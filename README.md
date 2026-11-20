@@ -75,7 +75,7 @@ Query fixtures for every language are in `bench/queries/`, for example `viewgrou
 
 ## MCP server for coding agents
 
-sillage serves its agent tools over the [Model Context Protocol](https://modelcontextprotocol.io) (protocol 2025-06-18 and 2025-03-26). Corpora stay indexed in RAM. A directory corpus is re-indexed incrementally, so only changed files are re-parsed.
+sillage serves its agent tools over the [Model Context Protocol](https://modelcontextprotocol.io) (protocol 2025-06-18, 2025-03-26 and 2024-11-05). Corpora stay indexed in RAM. A directory corpus is re-indexed incrementally, so only changed files are re-parsed.
 
 ```sh
 # Web-hosted (Streamable HTTP): http://HOST:8765/mcp, health at /healthz
@@ -96,9 +96,12 @@ sillage mcp --root .
 | `--default-corpus NAME` | The corpus used when a call names none. Defaults to `--root`, else the first `--corpus`. |
 | `--lang L[,L...]` | Languages indexed in directory corpora. Default: all 7. |
 | `--refresh-interval SECS` | Background incremental refresh. `0`, the default, refreshes only on `refresh_corpus`. |
-| `--host`, `--port` (`serve`) | Bind address. Default `127.0.0.1:8765`. |
-| `--token T` (`serve`) | Requires `Authorization: Bearer T` on `/mcp`. Defaults to `$SILLAGE_MCP_TOKEN`; prefer the variable, because arguments show up in `ps`. The token is compared in constant time and never logged. |
-| `--cors-origin O` (`serve`) | A browser origin allowed to call `/mcp` (repeatable; `*` allows any). Browser requests from any other origin get `403`. Clients that send no `Origin` header (CLI agents) are always allowed. |
+| `--host`, `--port` (`serve`) | Bind address. Default `127.0.0.1:8765`. A non-loopback address requires a token (or `--allow-unauthenticated`). |
+| `--token T` (`serve`) | Requires `Authorization: Bearer T` on `/mcp`. Defaults to `$SILLAGE_MCP_TOKEN`; prefer the variable, because arguments show up in `ps`. A set-but-blank token is an error, never "no auth". The token is compared in constant time (SHA-256 digests, so its length does not leak either) and never logged. |
+| `--allow-unauthenticated` (`serve`) | Serve without a token on a non-loopback address, or with `--cors-origin '*'`. Only for trusted networks: anyone who can reach the port can query the corpora. |
+| `--cors-origin O` (`serve`) | A browser origin allowed to call `/mcp` (repeatable). Browser requests from any other origin get `403`. Clients that send no `Origin` header (CLI agents) are always allowed. `*` allows any web page to call the tools, so it is refused without a token unless `--allow-unauthenticated` is also passed. |
+| `--allow-host H` (`serve`) | On a loopback bind, `/mcp` only accepts `Host: localhost`, `127.0.0.1` or `[::1]` (DNS-rebinding protection; others get `403`). Add the name a reverse proxy forwards, e.g. `--allow-host sillage.example.com` (repeatable; `*` disables the check). |
+| `--max-connections N` (`serve`) | Concurrent connections. Default 256; excess connections are closed at once. |
 | `--max-body-bytes N` (`serve`) | Request size limit. Default 2 MiB. Larger requests get `413`. |
 
 **Endpoints:**
@@ -108,7 +111,9 @@ sillage mcp --root .
 - `OPTIONS /mcp` answers CORS preflights.
 - `GET /healthz` returns `{"status":"ok"}` without auth.
 
-`initialize` issues an `Mcp-Session-Id`. A request that carries a session id that is unknown or was deleted gets `404`. Requests without a session id are served statelessly, because every tool depends only on its arguments. Sessions expire after 1 h idle, and at most 1024 are kept.
+`initialize` issues an `Mcp-Session-Id`. A request that carries a session id that is unknown or was deleted gets `404`. `POST`s without a session id are served statelessly, because every tool depends only on its arguments; `GET /mcp` needs one (`400` without). Sessions expire after 1 h idle (an open SSE stream keeps its session alive), and at most 1024 are kept. A stream lasts at most 1 h; clients reconnect.
+
+**Limits.** Request headers must arrive within 10 s (idle keep-alive connections are closed after the same time) and a body within 30 s (`408`). Tool calls run at most `2 × CPUs` (4–32) at a time and each gets 30 s (then `isError: true` "timed out"). JSON-RPC batches hold at most 32 messages, and none on protocol 2025-06-18, which removed batching. Concurrent `refresh_corpus` calls on one corpus coalesce: the second reports "refresh already in progress". On SIGTERM, open connections get 5 s to finish.
 
 ### Tools
 
@@ -189,12 +194,13 @@ args = ["mcp", "--root", "."]
 
 ```sh
 docker build -t sillage .
-docker run -d --name sillage -p 8765:8765 -e SILLAGE_MCP_TOKEN \
+export SILLAGE_MCP_TOKEN="$(openssl rand -hex 32)"
+docker run -d --name sillage -p 8765:8765 -e SILLAGE_MCP_TOKEN="$SILLAGE_MCP_TOKEN" \
   -v "$HOME/src/app:/workspace:ro" sillage \
   serve --host 0.0.0.0 --port 8765 --refresh-interval 120
 ```
 
-The image runs as a non-root `sillage` user, exposes 8765 and has a `HEALTHCHECK` on `/healthz`.
+The container binds `0.0.0.0`, so `SILLAGE_MCP_TOKEN` is required: without it the server exits with an error. Pass `--allow-unauthenticated` after `serve` only on a trusted network. The image runs as a non-root `sillage` user, exposes 8765 and has a `HEALTHCHECK` on `/healthz` (set `-e PORT=...` if you change `--port`).
 
 **systemd.** [`deploy/sillage.service`](deploy/sillage.service) is a hardened unit (`ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`, no capabilities). It reads the token from `/etc/sillage/sillage.env`. Install steps are in the unit's header comment. For anything beyond localhost, put a TLS-terminating reverse proxy in front.
 

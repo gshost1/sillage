@@ -122,6 +122,40 @@ fn missing_guards_over_a_git_diff() {
 }
 
 #[test]
+fn diff_hunks_widen_to_their_method_and_need_relevant_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    go_repo(dir.path());
+    // A clean method: its guards sit outside the edited lines.
+    let method = loader("LoadInvoice", "Invoice", "invoices", "res", "inv").replace("inv := &Invoice{}", "inv := &Invoice{Kind: 1}");
+    write(dir.path(), "billing/invoices.go", &format!("package billing\n\n{method}"));
+    let e = engine(dir.path(), Params::repo_preset());
+    let lines: Vec<&str> = method.lines().collect();
+    let at = lines.iter().position(|l| l.contains("Kind: 1")).unwrap();
+    // A 1-line context hunk: on its own it lacks `if err != nil` / `defer res.Close()`.
+    let hunk = |ctx_before: &str, ctx_after: &str| {
+        format!(
+            "--- a/billing/invoices.go\n+++ b/billing/invoices.go\n@@ -{n},3 +{n},3 @@\n {ctx_before}\n-\tinv := &Invoice{{}}\n+\tinv := &Invoice{{Kind: 1}}\n {ctx_after}\n",
+            n = at + 2,
+        )
+    };
+    let diff = hunk(lines[at - 1], lines[at + 1]);
+    // The hunk's new side alone draws (false) guard reports from its peers.
+    let after = sillage_engine::extract_diff_hunks(&diff).remove(0).after_code;
+    let alone = e.check_missing_guards(Lang::Go, &after, &GuardOptions::default()).unwrap();
+    assert!(!alone.is_empty(), "precondition: the bare hunk looks unguarded");
+    let found = e.check_missing_guards_in_diff(&diff, &GuardOptions::default()).unwrap();
+    assert!(found.is_empty(), "the method on disk already has its guards: {found:?}");
+
+    // Without a root (no disk access), the same hunk only keeps guards that
+    // touch its added lines' identifiers (`inv`, `Invoice`, `Kind`).
+    let (parts, _) = index_dir(dir.path(), Lang::ALL, &AromaFeaturizer).unwrap();
+    let rootless = Engine::from_parts(parts, Box::new(AromaFeaturizer), Params::repo_preset());
+    let found = rootless.check_missing_guards_in_diff(&diff, &GuardOptions::default()).unwrap();
+    let heads: Vec<&str> = found.iter().flat_map(|h| h.guards.iter().map(|g| g.head.as_str())).collect();
+    assert!(!heads.iter().any(|h| h.contains("res.Close") || *h == "if err != nil {"), "{heads:?}");
+}
+
+#[test]
 fn idioms_are_aligned_cited_and_confident() {
     let dir = tempfile::tempdir().unwrap();
     go_repo(dir.path());
@@ -273,3 +307,36 @@ fn test_idioms_follow_production_peers() {
     assert!(ti.tests.windows(2).all(|w| w[0].score >= w[1].score));
 }
 
+
+#[test]
+fn test_idioms_with_non_ascii_names_never_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let prod = |n: &str| format!("def {n}(p):\n    with open(p) as f:\n        data = f.read()\n    if not data:\n        raise ValueError(\"empty\")\n    return data.split()\n");
+    write(dir.path(), "app/conf.py", &format!("{}\n\n{}", prod("éval_config"), prod("ünload_config")));
+    write(dir.path(), "app/other.py", &prod("lëad_config"));
+    write(
+        dir.path(),
+        "tests/test_conf.py",
+        "def test_eval():\n    assert éval_config(\"a\") == []\n\ndef test_prefixed():\n    assert xéval_config(\"a\") == []\n    assert ééval_config(\"a\") == []\n",
+    );
+    let e = engine(dir.path(), Params::repo_preset());
+    let ti = e.find_test_idioms(Lang::Python, &prod("éval_config"), &TestIdiomOptions::default()).unwrap();
+    assert_eq!(ti.draft_name.as_deref(), Some("éval_config"));
+    let eval = ti.tests.iter().find(|t| t.test.name == "test_eval").expect("whole-word reference");
+    assert_eq!(eval.via, TestLink::ReferencesDraft);
+    assert!(ti.tests.iter().all(|t| t.test.name != "test_prefixed" || t.via != TestLink::ReferencesDraft));
+}
+
+#[test]
+fn deeply_nested_snippets_align_without_overflow() {
+    let depth = 15_000;
+    let lit = format!("{}{{a}}{}", "{a:".repeat(depth - 1), "}".repeat(depth - 1));
+    let draft = format!("let a = 1;\nlet o = {lit};");
+    let rec_text = format!("function f(b) {{\n  let b2 = 1;\n  let o = {lit};\n  return o;\n}}");
+    let body_start = rec_text.find('{').unwrap() as u32;
+    let rec = sillage_parse::parse_method(Lang::JavaScript, &rec_text, sillage_core::Span::new(body_start, rec_text.len() as u32)).unwrap();
+    let q = sillage_parse::parse_snippet(Lang::JavaScript, &draft).unwrap();
+    let keep = prune(&AromaFeaturizer.featurize_query(&q).total(), &rec, &AromaFeaturizer.featurize(&rec)).keep;
+    let al = render_aligned(&draft, &q, &rec, &keep, &AromaFeaturizer);
+    assert!(!al.code.is_empty());
+}

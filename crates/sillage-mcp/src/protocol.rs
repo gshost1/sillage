@@ -3,10 +3,19 @@
 //! Handles `initialize`, `ping`, `tools/list`, `tools/call` and notifications
 //! (`notifications/initialized` and any other: no response). Responses sent by
 //! the client (we never send requests) are ignored. Batches (JSON arrays,
-//! protocol 2025-03-26) are accepted; a batch of only notifications yields no
-//! response.
+//! protocol 2025-03-26) of at most [`MAX_BATCH`] messages are accepted; a
+//! batch of only notifications yields no response. (Protocol 2025-06-18
+//! removed batching; the HTTP transport rejects batches on sessions that
+//! negotiated it.)
+//!
+//! Tool calls run on the blocking pool behind a global concurrency limit and
+//! a per-call timeout ([`ToolLimits`]), so a flood of calls cannot pin every
+//! blocking thread or queue unbounded work.
 
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use serde_json::{Map, Value, json};
 
@@ -14,9 +23,15 @@ use crate::registry::CorpusRegistry;
 use crate::tools;
 
 /// Protocol versions this server speaks, newest first.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26"];
-/// Answered to `initialize` requests for any other version.
-pub const FALLBACK_PROTOCOL_VERSION: &str = "2025-03-26";
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+/// Answered to `initialize` requests for any other version: the latest one.
+pub const FALLBACK_PROTOCOL_VERSION: &str = "2025-06-18";
+/// The first protocol version without JSON-RPC batching.
+pub const NO_BATCH_PROTOCOL_VERSION: &str = "2025-06-18";
+/// Largest JSON-RPC batch accepted (larger ones are `-32600`).
+pub const MAX_BATCH: usize = 32;
+/// Default per-call tool timeout.
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const PARSE_ERROR: i64 = -32700;
 pub const INVALID_REQUEST: i64 = -32600;
@@ -47,9 +62,37 @@ editing files so new code becomes searchable.
 Tips: pass exclude_path=<the file you are editing> so it never matches itself; `lang` is one of \
 java, python, javascript, typescript, tsx, go, rust; open cited file:line locations for context.";
 
+/// Bounds on tool execution shared by every transport.
+#[derive(Clone)]
+pub struct ToolLimits {
+    /// Concurrent tool calls running on the blocking pool.
+    pub permits: Arc<Semaphore>,
+    /// Wall-clock limit per call, including the wait for a permit.
+    pub timeout: Duration,
+}
+
+impl ToolLimits {
+    pub fn new(max_concurrent: usize, timeout: Duration) -> Self {
+        Self { permits: Arc::new(Semaphore::new(max_concurrent.max(1))), timeout }
+    }
+
+    /// `2 × available_parallelism`, clamped to `4..=32`.
+    pub fn default_concurrency() -> usize {
+        let n = std::thread::available_parallelism().map_or(4, |n| n.get());
+        (2 * n).clamp(4, 32)
+    }
+}
+
+impl Default for ToolLimits {
+    fn default() -> Self {
+        Self::new(Self::default_concurrency(), DEFAULT_TOOL_TIMEOUT)
+    }
+}
+
 /// The MCP request dispatcher shared by all transports.
 pub struct Dispatcher {
     registry: Arc<CorpusRegistry>,
+    limits: ToolLimits,
 }
 
 /// A JSON-RPC error object.
@@ -85,6 +128,13 @@ pub fn negotiate_version(requested: Option<&str>) -> &'static str {
         .unwrap_or(FALLBACK_PROTOCOL_VERSION)
 }
 
+/// The `-32600` reply to an invalid message, echoing its `id` when that is a
+/// valid JSON-RPC id (string or number).
+pub fn invalid_request(msg: &Value) -> Value {
+    let id = msg.get("id").filter(|i| matches!(i, Value::String(_) | Value::Number(_))).cloned().unwrap_or(Value::Null);
+    error_response(id, INVALID_REQUEST, "invalid JSON-RPC 2.0 request")
+}
+
 /// What kind of JSON-RPC message a value is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
@@ -110,7 +160,17 @@ pub fn classify(msg: &Value) -> MessageKind {
 
 impl Dispatcher {
     pub fn new(registry: Arc<CorpusRegistry>) -> Self {
-        Self { registry }
+        Self { registry, limits: ToolLimits::default() }
+    }
+
+    /// Replaces the tool concurrency limit and timeout.
+    pub fn with_tool_limits(mut self, limits: ToolLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn tool_limits(&self) -> &ToolLimits {
+        &self.limits
     }
 
     pub fn registry(&self) -> &Arc<CorpusRegistry> {
@@ -132,6 +192,13 @@ impl Dispatcher {
                 if items.is_empty() {
                     return Some(error_response(Value::Null, INVALID_REQUEST, "empty batch"));
                 }
+                if items.len() > MAX_BATCH {
+                    return Some(error_response(
+                        Value::Null,
+                        INVALID_REQUEST,
+                        format!("batch of {} messages exceeds the limit of {MAX_BATCH}", items.len()),
+                    ));
+                }
                 let futs = items.into_iter().map(|m| self.handle_message(m));
                 let out: Vec<Value> = futures_util::future::join_all(futs).await.into_iter().flatten().collect();
                 (!out.is_empty()).then_some(Value::Array(out))
@@ -144,14 +211,7 @@ impl Dispatcher {
     pub async fn handle_message(&self, msg: Value) -> Option<Value> {
         match classify(&msg) {
             MessageKind::Notification | MessageKind::Response => None,
-            MessageKind::Invalid => {
-                let id = msg
-                    .get("id")
-                    .filter(|i| matches!(i, Value::String(_) | Value::Number(_)))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                Some(error_response(id, INVALID_REQUEST, "invalid JSON-RPC 2.0 request"))
-            }
+            MessageKind::Invalid => Some(invalid_request(&msg)),
             MessageKind::Request => {
                 let id = msg["id"].clone();
                 let method = msg["method"].as_str().unwrap_or_default();
@@ -192,7 +252,7 @@ impl Dispatcher {
                     Some(a @ Value::Object(_)) => a.clone(),
                     Some(_) => return Err(RpcError::invalid_params("`arguments` must be an object")),
                 };
-                let out = tools::call_tool(&self.registry, name, args).await?;
+                let out = tools::call_tool(&self.registry, &self.limits, name, args).await?;
                 Ok(json!({
                     "content": [{ "type": "text", "text": out.text }],
                     "isError": out.is_error,
@@ -200,5 +260,34 @@ impl Dispatcher {
             }
             other => Err(RpcError::new(METHOD_NOT_FOUND, format!("method not found: {other}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_negotiation() {
+        assert_eq!(negotiate_version(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(negotiate_version(Some("2025-03-26")), "2025-03-26");
+        assert_eq!(negotiate_version(Some("2024-11-05")), "2024-11-05");
+        assert_eq!(negotiate_version(Some("2099-01-01")), "2025-06-18", "unknown future version: latest");
+        assert_eq!(negotiate_version(None), "2025-06-18");
+    }
+
+    #[test]
+    fn invalid_requests_echo_valid_ids() {
+        assert_eq!(invalid_request(&json!({ "jsonrpc": "1.0", "id": 7, "method": "ping" }))["id"], 7);
+        assert_eq!(invalid_request(&json!({ "jsonrpc": "1.0", "id": "a", "method": "ping" }))["id"], "a");
+        assert_eq!(invalid_request(&json!({ "jsonrpc": "1.0", "id": [1], "method": "ping" }))["id"], Value::Null);
+        assert_eq!(invalid_request(&json!(5))["id"], Value::Null);
+    }
+
+    #[test]
+    fn default_tool_concurrency_is_bounded() {
+        let n = ToolLimits::default_concurrency();
+        assert!((4..=32).contains(&n));
+        assert_eq!(ToolLimits::new(0, DEFAULT_TOOL_TIMEOUT).permits.available_permits(), 1);
     }
 }

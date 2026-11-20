@@ -6,11 +6,12 @@
 //! [`CorpusHandle::refresh`] holds it while it re-walks and re-parses the
 //! directory (queries keep running on the old index meanwhile) and takes the
 //! engine's write lock only for the [`Engine::replace_index`] swap. Concurrent
-//! refreshes of one corpus serialize on the refresh lock.
+//! refreshes of one corpus coalesce: while one runs, the others return
+//! [`RefreshInProgress`] at once instead of queueing redundant directory walks.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, TryLockError};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
@@ -114,6 +115,21 @@ fn counts(corpus: &Corpus) -> (usize, usize) {
     let test = corpus.methods.iter().filter(|m| m.is_test).count();
     (corpus.methods.len() - test, test)
 }
+
+/// Returned (as the error) by [`CorpusHandle::refresh`] when another refresh
+/// of the same corpus is already running; its result serves both callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshInProgress {
+    pub corpus: String,
+}
+
+impl std::fmt::Display for RefreshInProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refresh of corpus {} already in progress", self.corpus)
+    }
+}
+
+impl std::error::Error for RefreshInProgress {}
 
 /// One loaded corpus.
 pub struct CorpusHandle {
@@ -219,12 +235,17 @@ impl CorpusHandle {
     }
 
     /// Incrementally re-indexes a directory corpus (blocking). The engine's
-    /// write lock is held only for the index swap.
+    /// write lock is held only for the index swap. When another refresh of
+    /// this corpus is running, returns a [`RefreshInProgress`] error at once.
     pub fn refresh(&self) -> anyhow::Result<RefreshStats> {
         let Some(refresher) = &self.refresher else {
             bail!("corpus {} is a static .sil snapshot; rebuild it with `sillage index` and restart to update it", self.name);
         };
-        let mut inc = refresher.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inc = match refresher.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(RefreshInProgress { corpus: self.name.clone() }.into()),
+        };
         let refresh = inc.refresh().with_context(|| format!("corpus {}: refresh failed", self.name))?;
         let stats = refresh.stats;
         let counted = refresh.parts.map(|parts: IndexParts| {
@@ -232,7 +253,8 @@ impl CorpusHandle {
             self.engine.write().unwrap_or_else(|e| e.into_inner()).replace_index(parts);
             c
         });
-        drop(inc);
+        // Stats are stored while the refresh lock is still held, so an older
+        // refresh can never overwrite a newer one's.
         let mut meta = self.meta.write().unwrap_or_else(|e| e.into_inner());
         if let Some((prod, test)) = counted {
             meta.prod_methods = prod;
@@ -242,6 +264,8 @@ impl CorpusHandle {
         meta.files = stats.total_files;
         meta.last_refresh = Some(SystemTime::now());
         meta.last_stats = Some(stats);
+        drop(meta);
+        drop(inc);
         Ok(stats)
     }
 }
@@ -350,11 +374,17 @@ impl CorpusRegistry {
     }
 
     /// Refreshes every directory corpus (blocking); snapshots are skipped.
-    pub fn refresh_all(&self) -> Vec<(String, anyhow::Result<RefreshStats>)> {
-        self.iter()
-            .filter(|h| h.kind == SourceKind::Directory)
-            .map(|h| (h.name.clone(), h.refresh()))
-            .collect()
+    /// `stop` is checked before each corpus: once it returns `true` the
+    /// remaining corpora are skipped (shutdown stays responsive).
+    pub fn refresh_all(&self, stop: &dyn Fn() -> bool) -> Vec<(String, anyhow::Result<RefreshStats>)> {
+        let mut out = Vec::new();
+        for h in self.iter().filter(|h| h.kind == SourceKind::Directory) {
+            if stop() {
+                break;
+            }
+            out.push((h.name.clone(), h.refresh()));
+        }
+        out
     }
 
     /// Refreshes all directory corpora every `every` until `shutdown`.
@@ -370,7 +400,8 @@ impl CorpusRegistry {
                     _ = tick.tick() => {}
                 }
                 let r = Arc::clone(&reg);
-                match tokio::task::spawn_blocking(move || r.refresh_all()).await {
+                let sd = shutdown.clone();
+                match tokio::task::spawn_blocking(move || r.refresh_all(&|| sd.is_triggered())).await {
                     Ok(results) => {
                         for (name, res) in results {
                             match res {
@@ -379,6 +410,7 @@ impl CorpusRegistry {
                                     s.files_added, s.files_modified, s.files_removed, s.total_methods, s.elapsed_ms
                                 ),
                                 Ok(_) => {}
+                                Err(e) if e.is::<RefreshInProgress>() => {}
                                 Err(e) => eprintln!("sillage: background refresh of {name} failed: {e:#}"),
                             }
                         }
@@ -387,5 +419,40 @@ impl CorpusRegistry {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir_corpus(name: &str) -> (tempfile::TempDir, CorpusHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.go"), "package a\n\nfunc F(x int) int {\n\treturn x + 1\n}\n").unwrap();
+        let h = CorpusHandle::open_dir(name, dir.path(), &[Lang::Go]).unwrap();
+        (dir, h)
+    }
+
+    #[test]
+    fn concurrent_refreshes_coalesce() {
+        let (_dir, h) = dir_corpus("app");
+        let guard = h.refresher.as_ref().unwrap().lock().unwrap(); // a refresh "in progress"
+        let err = h.refresh().unwrap_err();
+        assert_eq!(err.downcast_ref::<RefreshInProgress>(), Some(&RefreshInProgress { corpus: "app".into() }));
+        assert!(err.to_string().contains("already in progress"));
+        drop(guard);
+        assert!(h.refresh().is_ok(), "runs once the other refresh is done");
+    }
+
+    #[test]
+    fn refresh_all_stops_between_corpora() {
+        let (_a, a) = dir_corpus("a");
+        let (_b, b) = dir_corpus("b");
+        let reg = CorpusRegistry::from_handles(vec![a, b], None).unwrap();
+        assert_eq!(reg.refresh_all(&|| false).len(), 2);
+        assert!(reg.refresh_all(&|| true).is_empty());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let once = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        assert_eq!(reg.refresh_all(&once).len(), 1, "stop flag checked before the second corpus");
     }
 }

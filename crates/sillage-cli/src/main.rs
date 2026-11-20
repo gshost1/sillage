@@ -106,10 +106,22 @@ pub enum Command {
         /// $SILLAGE_MCP_TOKEN; prefer the variable (arguments show up in `ps`).
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
-        /// Browser origin allowed to call /mcp (repeatable; `*` for any).
-        /// Requests without an Origin header (CLI agents) are always allowed.
+        /// Browser origin allowed to call /mcp (repeatable; `*` for any, which
+        /// needs a token or --allow-unauthenticated). Requests without an
+        /// Origin header (CLI agents) are always allowed.
         #[arg(long = "cors-origin", value_name = "ORIGIN")]
         cors_origins: Vec<String>,
+        /// Serve without a token on a non-loopback address (or with
+        /// `--cors-origin *`). Only for trusted networks.
+        #[arg(long)]
+        allow_unauthenticated: bool,
+        /// Extra `Host` header value accepted on a loopback bind (repeatable;
+        /// e.g. a reverse proxy's name). Default: localhost, 127.0.0.1, [::1].
+        #[arg(long = "allow-host", value_name = "HOST")]
+        allowed_hosts: Vec<String>,
+        /// Concurrent connections served; excess ones are closed.
+        #[arg(long, default_value_t = sillage_mcp::http::DEFAULT_MAX_CONNECTIONS, value_parser = parse_positive)]
+        max_connections: usize,
         /// Largest accepted request body.
         #[arg(long, default_value_t = sillage_mcp::http::DEFAULT_MAX_BODY_BYTES, value_parser = parse_positive)]
         max_body_bytes: usize,
@@ -167,9 +179,10 @@ impl McpCorpusArgs {
     }
 }
 
-/// `--token`, else `$SILLAGE_MCP_TOKEN`; blank means none.
-fn resolve_token(flag: Option<String>) -> Option<String> {
-    flag.or_else(|| std::env::var(sillage_mcp::TOKEN_ENV).ok()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+/// `--token`, else `$SILLAGE_MCP_TOKEN`; a blank one is an error.
+fn resolve_token(flag: Option<String>) -> anyhow::Result<Option<String>> {
+    let env = std::env::var_os(sillage_mcp::TOKEN_ENV).map(|v| v.to_string_lossy().into_owned());
+    sillage_mcp::resolve_token(flag, env)
 }
 
 #[derive(Debug, Subcommand)]
@@ -668,14 +681,27 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Explain { input } => cmd_explain(&input),
         Command::Stats { index } => cmd_stats(&index),
-        Command::Serve { host, port, token, cors_origins, max_body_bytes, corpora } => {
+        Command::Serve {
+            host,
+            port,
+            token,
+            cors_origins,
+            allow_unauthenticated,
+            allowed_hosts,
+            max_connections,
+            max_body_bytes,
+            corpora,
+        } => {
             let http = sillage_mcp::HttpConfig {
-                token: resolve_token(token),
+                token: resolve_token(token)?,
                 cors_origins,
+                allowed_hosts,
+                max_connections,
                 max_body_bytes,
                 ..sillage_mcp::HttpConfig::default()
             };
-            let opts = sillage_mcp::ServeOptions { host, port, http, refresh_interval: corpora.refresh() };
+            let opts =
+                sillage_mcp::ServeOptions { host, port, http, refresh_interval: corpora.refresh(), allow_unauthenticated };
             sillage_mcp::run_http(corpora.load_options(), opts)
         }
         Command::Mcp { corpora } => sillage_mcp::run_stdio(corpora.load_options(), corpora.refresh()),
@@ -825,11 +851,23 @@ mod tests {
         match parse(&[
             "serve", "--host", "0.0.0.0", "--port", "9000", "--corpus", "a=/x", "--corpus", "b=/y.sil", "--root", "/r",
             "--cors-origin", "https://app.example", "--max-body-bytes", "1024", "--refresh-interval", "30", "--lang", "go,rust",
-            "--default-corpus", "b",
+            "--default-corpus", "b", "--allow-unauthenticated", "--allow-host", "mcp.internal", "--max-connections", "16",
         ]) {
-            Command::Serve { host, port, token, cors_origins, max_body_bytes, corpora } => {
+            Command::Serve {
+                host,
+                port,
+                token,
+                cors_origins,
+                allow_unauthenticated,
+                allowed_hosts,
+                max_connections,
+                max_body_bytes,
+                corpora,
+            } => {
                 assert_eq!((host.as_str(), port, token, max_body_bytes), ("0.0.0.0", 9000, None, 1024));
                 assert_eq!(cors_origins, ["https://app.example"]);
+                assert!(allow_unauthenticated);
+                assert_eq!((allowed_hosts, max_connections), (vec!["mcp.internal".to_string()], 16));
                 let names: Vec<&str> = corpora.corpora.iter().map(|c| c.name.as_str()).collect();
                 assert_eq!(names, ["a", "b"]);
                 assert_eq!(corpora.root.as_deref(), Some(Path::new("/r")));
@@ -851,9 +889,16 @@ mod tests {
     }
 
     #[test]
-    fn token_flag_overrides_env_and_blank_is_none() {
-        assert_eq!(resolve_token(Some("  t0k ".into())).as_deref(), Some("t0k"));
-        assert_eq!(resolve_token(Some("   ".into())), None);
+    fn token_flag_overrides_env_and_blank_is_an_error() {
+        assert_eq!(resolve_token(Some("  t0k ".into())).unwrap().as_deref(), Some("t0k"));
+        assert!(resolve_token(Some("   ".into())).unwrap_err().to_string().contains("blank"));
+        match parse(&["serve"]) {
+            Command::Serve { allow_unauthenticated, allowed_hosts, max_connections, .. } => {
+                assert!(!allow_unauthenticated && allowed_hosts.is_empty());
+                assert_eq!(max_connections, sillage_mcp::http::DEFAULT_MAX_CONNECTIONS);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

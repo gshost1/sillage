@@ -116,10 +116,14 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn start(registry: Arc<CorpusRegistry>, cfg: HttpConfig) -> Self {
+        Self::start_with(registry, cfg, sillage_mcp::ToolLimits::default()).await
+    }
+
+    pub async fn start_with(registry: Arc<CorpusRegistry>, cfg: HttpConfig, limits: sillage_mcp::ToolLimits) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Shutdown::new();
-        let d = Arc::new(Dispatcher::new(Arc::clone(&registry)));
+        let d = Arc::new(Dispatcher::new(Arc::clone(&registry)).with_tool_limits(limits));
         let handle = tokio::spawn(sillage_mcp::http::serve(listener, d, cfg, shutdown.clone()));
         Self { addr, registry, shutdown, handle }
     }

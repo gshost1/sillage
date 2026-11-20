@@ -12,7 +12,10 @@
 #
 # The token is read from SILLAGE_MCP_TOKEN in the EnvironmentFile, so it never
 # appears on the command line or in `ps`. Put a TLS-terminating reverse proxy
-# (Caddy, nginx) in front when exposing it beyond localhost.
+# (Caddy, nginx) in front when exposing it beyond localhost. On this loopback
+# bind, /mcp only accepts Host: localhost / 127.0.0.1 / [::1]; if the proxy
+# forwards the public Host (Caddy does by default), add
+# `--allow-host sillage.example.com` to ExecStart.
 
 [Unit]
 Description=sillage MCP server (structural code search for coding agents)

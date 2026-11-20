@@ -85,32 +85,34 @@ pub fn extract_diff_hunks(unified_diff: &str) -> Vec<DiffHunk> {
     for line in unified_diff.lines() {
         if let Some(h) = open.as_mut() {
             if h.old_left > 0 || h.new_left > 0 {
-                let (tag, text) = line.split_at(line.len().min(1));
-                match tag {
-                    " " | "" => {
+                // Dispatch on the ASCII tag byte: slicing at byte 1 is then
+                // always a char boundary, whatever the line's content.
+                let text = line.get(1..).unwrap_or("");
+                match line.as_bytes().first() {
+                    Some(b' ') | None => {
                         h.before.push(text.to_string());
                         h.after.push(text.to_string());
-                        h.old_no += 1;
-                        h.new_no += 1;
+                        h.old_no = h.old_no.saturating_add(1);
+                        h.new_no = h.new_no.saturating_add(1);
                         h.old_left = h.old_left.saturating_sub(1);
                         h.new_left = h.new_left.saturating_sub(1);
                         continue;
                     }
-                    "-" => {
+                    Some(b'-') => {
                         h.hunk.removed.push(DiffLine { line: h.old_no, text: text.to_string() });
                         h.before.push(text.to_string());
-                        h.old_no += 1;
+                        h.old_no = h.old_no.saturating_add(1);
                         h.old_left = h.old_left.saturating_sub(1);
                         continue;
                     }
-                    "+" => {
+                    Some(b'+') => {
                         h.hunk.added.push(DiffLine { line: h.new_no, text: text.to_string() });
                         h.after.push(text.to_string());
-                        h.new_no += 1;
+                        h.new_no = h.new_no.saturating_add(1);
                         h.new_left = h.new_left.saturating_sub(1);
                         continue;
                     }
-                    "\\" => continue, // "\ No newline at end of file"
+                    Some(b'\\') => continue, // "\ No newline at end of file"
                     _ => {}
                 }
             } else if line.starts_with('\\') {
@@ -318,5 +320,29 @@ deleted file mode 100644
         assert!(extract_diff_hunks("").is_empty());
         assert!(extract_diff_hunks("not a diff\n@@ nonsense @@\n").is_empty());
         assert_eq!(split_git_paths("\"a/with space.rs\" \"b/with space.rs\""), Some(("with space.rs".into(), "with space.rs".into())));
+    }
+
+    #[test]
+    fn non_ascii_lines_inside_a_hunk_never_panic() {
+        // A line starting with a multi-byte char (a mangled diff) ends the hunk.
+        let d = "--- a/x.py\n+++ b/x.py\n@@ -1,3 +1,3 @@\n+é = 1\nélan = 2\n-ü\n 日本\n";
+        let h = extract_diff_hunks(d);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].added, [DiffLine { line: 1, text: "é = 1".into() }]);
+        let d = "--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n-ü = 1\n+日本 = 2\n 😀\n";
+        let h = extract_diff_hunks(d);
+        assert_eq!((h[0].removed[0].text.as_str(), h[0].added[0].text.as_str()), ("ü = 1", "日本 = 2"));
+        assert_eq!(h[0].after_code, "日本 = 2\n😀");
+    }
+
+    #[test]
+    fn line_numbers_saturate_at_u32_max() {
+        let d = "--- a/x.rs\n+++ b/x.rs\n@@ -4294967295,3 +4294967295,3 @@\n a\n-b\n+c\n d\n";
+        let h = extract_diff_hunks(d);
+        assert_eq!(h[0].removed[0].line, u32::MAX);
+        assert_eq!(h[0].added[0].line, u32::MAX);
+        let d = "--- a/x.rs\n+++ b/x.rs\n@@ -4294967295,1 +4294967295,1 @@\n-a\n+b\n";
+        let h = extract_diff_hunks(d);
+        assert_eq!((h[0].old_start, h[0].new_start), (u32::MAX, u32::MAX));
     }
 }

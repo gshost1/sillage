@@ -138,6 +138,21 @@ impl Bm25 {
         self.terms.len()
     }
 
+    /// Number of indexed documents.
+    pub fn num_docs(&self) -> usize {
+        self.doc_ids.len()
+    }
+
+    /// Methods whose indexed text contains `term` as a whole [`tokenize`] word
+    /// (a posting-list lookup, no text scan). Empty for unknown terms.
+    pub fn docs_with_term(&self, term: &str) -> impl Iterator<Item = MethodId> + '_ {
+        let range = match self.terms.binary_search_by(|x| x.as_ref().cmp(term)) {
+            Ok(t) => self.offsets[t] as usize..self.offsets[t + 1] as usize,
+            Err(_) => 0..0,
+        };
+        self.post_docs[range].iter().map(|&d| self.doc_ids[d as usize])
+    }
+
     /// Checks every invariant [`search`](Self::search) relies on, for a BM25
     /// index loaded from disk over a corpus of `expected_methods` methods.
     pub fn validate(&self, expected_methods: usize) -> anyhow::Result<()> {
@@ -195,6 +210,11 @@ pub fn tokenize(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_string)
 }
 
+/// [`tokenize`] over an owned string.
+pub fn tokenize_owned(text: String) -> impl Iterator<Item = String> {
+    tokenize(&text).collect::<Vec<_>>().into_iter()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +263,13 @@ mod validate_tests {
         let b = Bm25::build_from_texts(&docs);
         assert_eq!(b.search("a", 1)[0].0, MethodId(0));
         assert_eq!(b.search_where("a", 1, |id| id != MethodId(0))[0].0, MethodId(1));
+    }
+
+    #[test]
+    fn postings_lookup() {
+        let b = Bm25::build_from_texts(&[(MethodId(0), "load_user(x)"), (MethodId(1), "x.load_user_v2()"), (MethodId(2), "load_user")]);
+        assert_eq!(b.num_docs(), 3);
+        assert_eq!(b.docs_with_term("load_user").collect::<Vec<_>>(), [MethodId(0), MethodId(2)]);
+        assert_eq!(b.docs_with_term("nope").count(), 0);
     }
 }
