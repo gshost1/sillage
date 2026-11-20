@@ -1,6 +1,6 @@
 //! On-disk persistence.
 //!
-//! Layout (format version 5):
+//! Layout (format version 6):
 //!
 //! | bytes   | content                                              |
 //! |---------|------------------------------------------------------|
@@ -27,7 +27,8 @@ const MAGIC: &[u8; 8] = b"SILLAGE1";
 /// 3: BM25 terms are case-sensitive whole identifiers (`bm25::tokenize`).
 /// 4: `xxh3_64` payload checksum in the header; structures validated on load.
 /// 5: per-method feature counts `|F(m)|` (`InvertedIndex::sizes`) for the Phase II tie-break bound.
-pub const FORMAT_VERSION: u32 = 5;
+/// 6: per-method `is_test` and `file_id`, and the per-file import table `Corpus::file_imports`.
+pub const FORMAT_VERSION: u32 = 6;
 const HEADER_LEN: usize = MAGIC.len() + 4 + 8;
 
 /// Serializes the index to bytes (header + payload).

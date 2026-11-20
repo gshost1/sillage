@@ -111,7 +111,7 @@ Stage 5 (ties broken by method id) had Sillage strict R@1 82.4% / 81.3% contiguo
 
 ## Documentation
 
-- [docs/DESIGN.md](docs/DESIGN.md): architecture, crate graph, how each paper ambiguity was resolved (Decisions 1–24), and index format v5 (xxh3 checksum, per-method sizes, validation on load).
+- [docs/DESIGN.md](docs/DESIGN.md): architecture, crate graph, how each paper ambiguity was resolved (Decisions 1–24), and index format v6 (xxh3 checksum, per-method sizes, test flags and per-file imports, validation on load).
 - [reports/final-benchmarks.md](reports/final-benchmarks.md): Stage 5 benchmarks and the list of review fixes. Earlier stages are in `reports/`.
 
 ## License

@@ -19,6 +19,8 @@ fn method(id: u32, body: &str) -> MethodRecord {
         line_start: id + 1,
         body: Span::new(start, text.len() as u32 - 1),
         text: Arc::from(text),
+        is_test: id == 3,
+        file_id: id % 2,
     }
 }
 
@@ -29,6 +31,10 @@ fn corpus() -> Corpus {
             method(1, " view.getChildCount(); ViewGroup group = (ViewGroup) view; "),
             method(2, " if (view instanceof ViewGroup) { hideKeyboard(view); } "),
             method(3, " return a + b; "),
+        ],
+        file_imports: vec![
+            vec!["import java.util.List;".into()],
+            vec!["import android.view.View;".into(), "import android.view.ViewGroup;".into()],
         ],
     }
 }
@@ -114,7 +120,10 @@ fn save_load_roundtrip() {
     assert_eq!(&bytes[8..12], &sillage_index::FORMAT_VERSION.to_le_bytes());
 
     let (c2, i2, b2) = load(&path).unwrap();
+    assert_eq!(c2, corpus);
     assert_eq!(c2.methods, corpus.methods);
+    assert_eq!(c2.imports_of(&c2.methods[1]), ["import android.view.View;".into(), "import android.view.ViewGroup;".into()] as [Box<str>; 2]);
+    assert!(c2.methods[3].is_test && !c2.methods[0].is_test);
     assert_eq!(i2, index);
     assert_eq!(b2, bm25);
 
@@ -142,14 +151,18 @@ fn load_rejects_bad_files() {
     std::fs::write(&bad_version, &bytes).unwrap();
     assert!(load(&bad_version).unwrap_err().to_string().contains("version 99"));
 
-    // Stage 5: pre-v4 files are rejected with a rebuild hint.
-    let old = dir.path().join("old");
-    let mut bytes = b"SILLAGE1".to_vec();
-    bytes.extend_from_slice(&3u32.to_le_bytes());
-    bytes.extend_from_slice(&[0; 32]);
-    std::fs::write(&old, &bytes).unwrap();
-    let err = load(&old).unwrap_err().to_string();
-    assert!(err.contains("version 3") && err.contains("sillage index"), "{err}");
+    // Stage 5: pre-v4 files are rejected with a rebuild hint; so are v5 files
+    // (no import table / test flags) since the agent-engine format v6.
+    assert_eq!(sillage_index::FORMAT_VERSION, 6);
+    for v in [3u32, 5] {
+        let old = dir.path().join(format!("old{v}"));
+        let mut bytes = b"SILLAGE1".to_vec();
+        bytes.extend_from_slice(&v.to_le_bytes());
+        bytes.extend_from_slice(&[0; 32]);
+        std::fs::write(&old, &bytes).unwrap();
+        let err = load(&old).unwrap_err().to_string();
+        assert!(err.contains(&format!("version {v}")) && err.contains("sillage index"), "{err}");
+    }
 
     let truncated = dir.path().join("d");
     let mut bytes = b"SILLAGE1".to_vec();
@@ -258,6 +271,15 @@ fn load_validates_structures() {
     let mut c = good.clone();
     c.methods[3].body = Span::new(5, 4);
     assert!(check(&c, &index, &bm25).is_err());
+
+    // v6: a file_id outside the import table.
+    let mut c = good.clone();
+    c.methods[1].file_id = 2;
+    let err = check(&c, &index, &bm25).unwrap_err();
+    assert!(err.contains("file_id") && err.contains("M1"), "{err}");
+    let mut c = good.clone();
+    c.file_imports.clear();
+    assert!(check(&c, &index, &bm25).unwrap_err().contains("file_id"));
 
     // Index / BM25 built for a different number of methods.
     let mut fewer = good.clone();

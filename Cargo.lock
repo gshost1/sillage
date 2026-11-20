@@ -910,6 +910,9 @@ dependencies = [
  "sillage-core",
  "sillage-index",
  "sillage-parse",
+ "sillage-render",
+ "similar 3.2.1",
+ "tempfile",
 ]
 
 [[package]]
@@ -957,7 +960,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sillage-core",
- "sillage-engine",
  "similar 3.2.1",
 ]
 

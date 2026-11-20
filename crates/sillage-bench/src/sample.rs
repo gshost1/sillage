@@ -240,6 +240,8 @@ mod tests {
             line_start: 1,
             body: Span::new(start, text.len() as u32),
             text: Arc::from(text),
+            is_test: false,
+            file_id: 0,
         }
     }
 
@@ -305,6 +307,8 @@ mod tests {
             line_start: 1,
             body: Span::new(text.find("# c").unwrap() as u32, text.len() as u32),
             text: Arc::from(text),
+            is_test: false,
+            file_id: 0,
         };
         assert_eq!(code_lines(&py), vec!["    y = x", "    return y"]);
     }
@@ -319,6 +323,8 @@ mod tests {
             line_start: 1,
             body: Span::new(text.find(":\n").unwrap() as u32 + 2, text.len() as u32),
             text: Arc::from(text),
+            is_test: false,
+            file_id: 0,
         }
     }
 

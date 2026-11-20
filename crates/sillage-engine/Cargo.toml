@@ -8,12 +8,15 @@ license.workspace = true
 sillage-core.workspace = true
 sillage-parse.workspace = true
 sillage-index.workspace = true
+sillage-render.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
+similar.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+tempfile.workspace = true

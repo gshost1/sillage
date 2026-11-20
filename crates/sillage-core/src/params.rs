@@ -113,3 +113,53 @@ impl Default for Params {
         }
     }
 }
+
+impl Params {
+    /// Thresholds for agent use on a single repository (500–50k methods).
+    ///
+    /// A single repo has far fewer near-duplicates than the paper's 5,417-project
+    /// corpus, so the paper thresholds rarely form multi-method clusters: τ1, τ2
+    /// and τ3 are softened (0.55 / 1.25 / 0.80) so that two or three peers sharing
+    /// an idiom cluster, η1 / η2 are sized for a single repo, and k keeps only the
+    /// few strongest recommendations an agent should read. [`Params::default`]
+    /// (the paper settings used by every benchmark) is unchanged.
+    pub fn repo_preset() -> Self {
+        Self {
+            eta1: 500,
+            eta2: 60,
+            tau1: 0.55,
+            tau2: 1.25,
+            tau3: 0.80,
+            k: 3,
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_the_paper_and_preset_is_softer() {
+        let d = Params::default();
+        assert_eq!((d.eta1, d.eta2, d.k), (1000, 100, 5));
+        assert_eq!((d.tau1, d.tau2, d.tau3, d.jaccard), (0.65, 1.5, 0.9, 0.5));
+        assert_eq!(d.s_denominator, SDenom::PrunedFirst);
+        assert_eq!(d.intersect_union, IntersectOp::AsPaper);
+        assert_eq!(d.dedup_against, Dedup::AllEarlier);
+        assert_eq!(d.singleton, Singleton::FullBody);
+        assert!(d.complete_calls);
+        assert_eq!(d.cluster_ties, ClusterTies::First);
+
+        let r = Params::repo_preset();
+        assert_eq!((r.tau1, r.tau2, r.tau3), (0.55, 1.25, 0.80));
+        assert!(r.tau1 < d.tau1 && r.tau2 < d.tau2 && r.tau3 < d.tau3);
+        assert!(r.eta1 <= d.eta1 && r.eta2 <= d.eta2 && r.k <= d.k);
+        assert_eq!(r.jaccard, d.jaccard);
+        assert_eq!(
+            Params { eta1: d.eta1, eta2: d.eta2, tau1: d.tau1, tau2: d.tau2, tau3: d.tau3, k: d.k, ..r },
+            d
+        );
+    }
+}

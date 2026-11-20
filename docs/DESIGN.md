@@ -23,19 +23,21 @@ sillage-core
    ▲
 sillage-parse
    ▲
-sillage-index
-   ▲
-sillage-engine
+sillage-index      sillage-render (core only)
+   ▲                  ▲
+sillage-engine ───────┘
    ▲          ▲
-sillage-render ◄── sillage-bench
-      ▲          ▲
+sillage-bench │
+      ▲       │
       sillage-cli
 ```
 
-Every crate depends on `sillage-core`. `sillage-bench` depends on `sillage-render`
-(the quality bench compares *rendered* recommendation lines with the held-out
-half). `sillage-engine` only touches `sillage-parse` and `sillage-index` inside
-`pipeline.rs`.
+Every crate depends on `sillage-core`. `sillage-render` lays out trees from
+`sillage-core` only; `sillage-engine` uses it for the agent analyses
+(variable-aligned code and diffs, `agent.rs`). `sillage-bench` depends on
+`sillage-render` (the quality bench compares *rendered* recommendation lines
+with the held-out half). The Aroma pipeline (`pipeline.rs`) is the only engine
+module that runs Phases I–III.
 
 ## Paper Clarifications & Decisions (implemented in `sillage-core::params::Params`)
 
@@ -64,11 +66,11 @@ half). `sillage-engine` only touches `sillage-parse` and `sillage-index` inside
 23. **BM25 tokens** are case-sensitive whole identifiers (`getChildCount`, `HTTPServer_v2`); the Stage 3 ablation found sub-word splitting dilutes IDF.
 24. **Phase II tie-break (Stage 6):** candidates are ranked by `TieKey = (sim DESC, overlap DESC, full_sim DESC, size ASC, id ASC)`. `sim` is the pruned similarity, Aroma's ranking, which is unchanged; the other keys only order equal-`sim` candidates. `overlap` is the Phase I set overlap, the Stage 5 secondary key. `full_sim = |F_full(q) ∩ F(m)|` uses the query's full featurization (`Featurizer::featurize`), whose cross-line sibling and variable-usage features query mode drops (Decision 18): among methods that contain the same query-mode features, it prefers the one whose lines are laid out as in the snippet. `size = |F(m)|` prefers the tighter method, with fewer features outside the query. Before Stage 6, ties on `(sim, overlap)` (every full-query tie) fell through to `MethodId`. All keys are computed from alpha-renamed features, so the ranking is invariant under renaming locals (e2e `sim_ties_break_structurally_and_alpha_invariantly`); raw identifier names are never used. Of the orders measured on the development seed 7 (`full_sim` alone, `size` alone, both, and with or without `overlap` first), `full_sim` then `size` was best. `overlap`-first equals `full_sim`-first on non-contiguous queries and is 0.1 points behind on contiguous ones. It was kept because it only refines the Stage 5 order and prunes more. Seed 2027 was not used for tuning.
 
-## Index format (v5)
+## Index format (v6)
 
-`b"SILLAGE1"` magic, `u32` LE format version (5), `u64` LE `xxh3_64` of the payload, then `postcard((Corpus, InvertedIndex, Bm25))`. `load` checks the magic, rejects older versions with a rebuild hint, verifies the checksum before decoding, and then validates:
+`b"SILLAGE1"` magic, `u32` LE format version (6), `u64` LE `xxh3_64` of the payload, then `postcard((Corpus, InvertedIndex, Bm25))`. `load` checks the magic, rejects older versions with a rebuild hint, verifies the checksum before decoding, and then validates:
 
-- `Corpus`: `methods[i].id == MethodId(i)`; every body span satisfies `start <= end <= text.len()` on UTF-8 character boundaries;
+- `Corpus`: `methods[i].id == MethodId(i)`; every body span satisfies `start <= end <= text.len()` on UTF-8 character boundaries; every `file_id < file_imports.len()` (v6: per-method `is_test` and `file_id`, and `file_imports`, the deduplicated import statements of each file that contributed a method);
 - `InvertedIndex`: `offsets.len() == feature_ids.len() + 1`, offsets start at 0 and are non-decreasing, the last offset equals `postings.len()`, `counts.len() == postings.len()`, feature ids strictly increasing, every posting `< num_methods`, `num_methods == |corpus|`, `sizes.len() == num_methods` (v5: per-method `|F(m)|`, 0 for an id built from several bags, so it stays a lower bound for Decision 20);
 - `Bm25`: one document (and length) per corpus method, offsets consistent with terms and postings, postings and document ids in range, finite `avgdl`.
 

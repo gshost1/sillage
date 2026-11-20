@@ -62,6 +62,16 @@ impl Layout {
         out
     }
 
+    /// The rendered code without dropped-code placeholder lines.
+    pub fn code_without_placeholders(&self) -> String {
+        self.lines.iter().filter(|l| !l.placeholder).map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The extra (recommended) code lines, excluding placeholders, joined with `\n`.
+    pub fn extra_code(&self) -> String {
+        self.lines.iter().filter(|l| l.extra && !l.placeholder).map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+    }
+
     /// Number of extra (recommended) code lines, excluding placeholders.
     pub fn extra_code_lines(&self) -> usize {
         self.lines.iter().filter(|l| l.extra && !l.placeholder).count()
@@ -102,6 +112,8 @@ impl Layout {
 #[derive(Debug, Clone, Copy)]
 struct Term {
     span: Span,
+    /// Index into `tree.leaves` for `Token` terminals.
+    leaf: Option<usize>,
     /// `None` for keywords, `Some(matched)` for non-keyword tokens.
     matched: Option<bool>,
     /// Keyword whose parent node holds no query-matched token (e.g. the closing
@@ -184,7 +196,8 @@ fn collect_terms(tree: &SimplifiedTree, query_match: &[bool]) -> Vec<Term> {
         if span.is_empty() || span.end > src_len {
             continue;
         }
-        terms.push(Term { span, matched, kw_extra });
+        let leaf = (node.kind.is_token() && leaf_pos[id] != usize::MAX).then_some(leaf_pos[id]);
+        terms.push(Term { span, leaf, matched, kw_extra });
     }
     terms.sort_by_key(|t| (t.span.start, t.span.end));
     // Drop terminals overlapping an earlier one (defensive; spans should be disjoint).
@@ -260,6 +273,14 @@ fn gap_has_code(gap: &str, lang: sillage_core::Lang) -> bool {
 
 /// Lays out `tree` against `query_match` (aligned with `tree.leaves`).
 pub fn layout(tree: &SimplifiedTree, query_match: &[bool], query: Option<&str>) -> Layout {
+    layout_with(tree, query_match, query, &[])
+}
+
+/// [`layout`] with per-leaf replacement text: `overrides[i] = Some(text)` renders
+/// leaf `tree.leaves[i]` as `text` instead of its source span (variable
+/// renaming by token span, so strings, comments, keywords and member names are
+/// never touched). Missing entries render the source text.
+pub fn layout_with(tree: &SimplifiedTree, query_match: &[bool], query: Option<&str>, overrides: &[Option<String>]) -> Layout {
     let src: &str = &tree.source;
     let terms = collect_terms(tree, query_match);
     let placeholder = tree.lang.placeholder();
@@ -339,7 +360,7 @@ pub fn layout(tree: &SimplifiedTree, query_match: &[bool], query: Option<&str>) 
         }
 
         // Copy the terminal itself (may span lines, e.g. block strings).
-        let text = &src[start..end];
+        let text = term.leaf.and_then(|l| overrides.get(l)).and_then(Option::as_deref).unwrap_or(&src[start..end]);
         let mut src_line = line_of(&line_starts, start);
         for (i, part) in text.split('\n').enumerate() {
             if i > 0 {
@@ -456,4 +477,93 @@ pub fn diff_summary(query: &str, code: &str) -> DiffSummary {
         unchanged,
         unified,
     }
+}
+
+/// A line's comparison key: trimmed, without a trailing `//` comment or a
+/// ` #` comment (outside string / char literals).
+fn diff_key(line: &str) -> &str {
+    let t = line.trim();
+    let b = t.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'"' | b'`' => quote = Some(c),
+                // A quote only when it closes later on the line (Rust lifetimes don't).
+                b'\'' if b[i + 1..].contains(&b'\'') => quote = Some(c),
+                b'/' if b.get(i + 1) == Some(&b'/') && i > 0 => return t[..i].trim_end(),
+                b'#' if i > 0 && b[i - 1].is_ascii_whitespace() => return t[..i].trim_end(),
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    t
+}
+
+/// Unified diff of `old` (e.g. the agent's draft) against `new` (e.g. a
+/// recommendation), with `---` / `+++` headers naming them. Both sides are
+/// dedented and lines are compared ignoring indentation, trailing whitespace
+/// and trailing comments, so re-indented or annotated code is not reported as
+/// changed; output lines keep their own side's text (equal lines show `old`).
+/// Blank lines are ignored. Returns an empty string when the two sides match.
+pub fn unified_diff(old: &str, new: &str, old_name: &str, new_name: &str) -> String {
+    use similar::{DiffOp, capture_diff_slices, group_diff_ops};
+    let prep = |s: &str| -> Vec<String> {
+        let lines: Vec<&str> = s.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+        let common = lines.iter().map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+        lines.iter().map(|l| l[common.min(l.len() - l.trim_start().len())..].to_string()).collect()
+    };
+    let (a, b) = (prep(old), prep(new));
+    let ka: Vec<&str> = a.iter().map(|l| diff_key(l)).collect();
+    let kb: Vec<&str> = b.iter().map(|l| diff_key(l)).collect();
+    let ops = capture_diff_slices(similar::Algorithm::Myers, &ka, &kb);
+    if ops.iter().all(|o| matches!(o, DiffOp::Equal { .. })) {
+        return String::new();
+    }
+    let mut out = format!("--- {old_name}\n+++ {new_name}\n");
+    for group in group_diff_ops(ops, 3) {
+        let (Some(first), Some(last)) = (group.first(), group.last()) else { continue };
+        let (o0, n0) = (first.old_range().start, first.new_range().start);
+        let (o1, n1) = (last.old_range().end, last.new_range().end);
+        let range = |start: usize, len: usize| if len == 0 { format!("{start},0") } else if len == 1 { format!("{}", start + 1) } else { format!("{},{len}", start + 1) };
+        out.push_str(&format!("@@ -{} +{} @@\n", range(o0, o1 - o0), range(n0, n1 - n0)));
+        for op in &group {
+            match *op {
+                DiffOp::Equal { old_index, len, .. } => {
+                    for l in &a[old_index..old_index + len] {
+                        out.push_str(&format!(" {l}\n"));
+                    }
+                }
+                DiffOp::Delete { old_index, old_len, .. } => {
+                    for l in &a[old_index..old_index + old_len] {
+                        out.push_str(&format!("-{l}\n"));
+                    }
+                }
+                DiffOp::Insert { new_index, new_len, .. } => {
+                    for l in &b[new_index..new_index + new_len] {
+                        out.push_str(&format!("+{l}\n"));
+                    }
+                }
+                DiffOp::Replace { old_index, old_len, new_index, new_len } => {
+                    for l in &a[old_index..old_index + old_len] {
+                        out.push_str(&format!("-{l}\n"));
+                    }
+                    for l in &b[new_index..new_index + new_len] {
+                        out.push_str(&format!("+{l}\n"));
+                    }
+                }
+            }
+        }
+    }
+    out
 }

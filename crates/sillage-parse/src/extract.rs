@@ -60,6 +60,7 @@ pub(crate) fn extract(lang: Lang, src: &str) -> Vec<ExtractedMethod> {
             text_span: Span::new(start as u32, end as u32),
             body_span,
             tree,
+            test_context: crate::testdetect::node_test_context(lang, node, src),
         });
     }
     out

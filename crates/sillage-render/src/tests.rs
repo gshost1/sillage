@@ -469,3 +469,61 @@ fn located_layout_shows_file_lines() {
     assert!(html.contains(&format!("<span class=\"line matched\" data-line=\"{first}\">try {{</span>")), "{html}");
     assert!(html.contains("<span class=\"line extra placeholder\">"), "{html}");
 }
+
+/// Stage 1 (agent engine): per-leaf overrides replace exactly the token spans.
+#[test]
+fn layout_with_overrides_renames_tokens_only() {
+    let full = build(Lang::Java, JAVA);
+    let mut overrides: Vec<Option<String>> = vec![None; full.leaves.len()];
+    for (i, &l) in full.leaves.iter().enumerate() {
+        if full.label(l) == "is" {
+            overrides[i] = Some("stream".into());
+        }
+    }
+    let qm = vec![true; full.leaves.len()];
+    let lay = crate::layout_with(&full, &qm, None, &overrides);
+    let code = lay.code();
+    assert!(code.contains("InputStream stream = am.open(fileName);"), "{code}");
+    assert!(code.contains("BitmapFactory.decodeStream(stream);"), "{code}");
+    assert!(code.contains("stream.close();"), "{code}");
+    assert!(code.contains("\"decoded\""), "{code}");
+    assert_eq!(crate::layout(&full, &qm, None).code().matches("is").count(), code.matches("is").count() + 3);
+}
+
+#[test]
+fn unified_diff_ignores_indentation_and_reports_insertions() {
+    let draft = "    InputStream is = am.open(fileName);\n    Bitmap image = BitmapFactory.decodeStream(is);\n";
+    let rec = "InputStream is = am.open(fileName);\nBitmap image = BitmapFactory.decodeStream(is);\nis.close();\n";
+    let d = crate::unified_diff(draft, rec, "draft", "recommendation");
+    assert_eq!(
+        d,
+        "--- draft\n+++ recommendation\n@@ -1,2 +1,3 @@\n InputStream is = am.open(fileName);\n Bitmap image = BitmapFactory.decodeStream(is);\n+is.close();\n"
+    );
+    assert_eq!(crate::unified_diff(draft, "  InputStream is = am.open(fileName);\n\n  Bitmap image = BitmapFactory.decodeStream(is);", "a", "b"), "");
+    let d = crate::unified_diff("a();\nb();\n", "a();\nc();\n", "x", "y");
+    assert!(d.contains("-b();\n+c();\n"), "{d}");
+    assert_eq!(crate::unified_diff("a = f(x);\nb();", "a = f(x); // why\nb();  # note", "x", "y"), "");
+    let d = crate::unified_diff("s = \"a // b\";", "s = \"a // c\";", "x", "y");
+    assert!(d.contains("-s = \"a // b\";"), "{d}");
+    let d = crate::unified_diff("", "x();\n", "x", "y");
+    assert!(d.contains("@@ -0,0 +1 @@\n+x();\n"), "{d}");
+}
+
+#[test]
+fn render_modes() {
+    use crate::{RenderMode, render_mode};
+    let full = build(Lang::Java, JAVA);
+    let (tree, qm) = prune(&full, &[5, 7], &[4, 6]);
+    let lay = layout(&tree, &qm, None);
+    assert_eq!(render_mode(&lay, RenderMode::Full, None), lay.code());
+    let compact = render_mode(&lay, RenderMode::Compact, None);
+    assert_eq!(compact, "    Bitmap image = BitmapFactory.decodeStream(is);\n    is.close();\n// ...\n} catch (IOException e) {");
+    let diff = render_mode(&lay, RenderMode::Diff, Some("InputStream is = am.open(fileName);\nBitmap image = BitmapFactory.decodeStream(is);"));
+    assert!(diff.contains("+    is.close();") && !diff.contains("// ..."), "{diff}");
+    for m in [RenderMode::Compact, RenderMode::Diff, RenderMode::Full] {
+        assert_eq!(m.to_string().parse::<RenderMode>().unwrap(), m);
+    }
+    assert!("x".parse::<RenderMode>().is_err());
+    let none = layout(&full, &vec![true; full.leaves.len()], None);
+    assert_eq!(render_mode(&none, RenderMode::Compact, None), "");
+}

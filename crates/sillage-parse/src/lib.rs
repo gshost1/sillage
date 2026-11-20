@@ -10,10 +10,17 @@ use sillage_core::{Lang, SimplifiedTree, Span};
 use tree_sitter::{Parser, Tree};
 
 mod extract;
+mod imports;
 mod lang;
 mod lower;
+mod rename;
 mod scope;
 mod snippet;
+mod testdetect;
+
+pub use imports::{extract_imports, referenced_identifiers, relevant_imports, relevant_imports_excluding};
+pub use rename::{rename_identifiers, shorthand_spans};
+pub use testdetect::{is_test_method, is_test_path};
 
 #[derive(Debug, Clone)]
 pub struct ExtractedMethod {
@@ -22,6 +29,10 @@ pub struct ExtractedMethod {
     pub text_span: Span,
     pub body_span: Span,
     pub tree: SimplifiedTree,
+    /// Test context outside the method's own text: a Rust `#[test]`-style
+    /// attribute or `#[cfg(test)]` module, a Python `Test*` / `TestCase` class or
+    /// pytest decorator, a JS/TS `describe`/`it`/`test` callback, a Java test class.
+    pub test_context: bool,
 }
 
 /// The tree-sitter grammar used for `lang`.

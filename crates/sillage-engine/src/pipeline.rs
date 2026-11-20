@@ -6,9 +6,10 @@ use std::time::Instant;
 use rayon::prelude::*;
 use sillage_core::{FeatureBag, Lang, MethodId, MethodRecord, SimplifiedTree, lang_compatible};
 
+use crate::filter::CompiledFilter;
 use crate::{
-    Engine, Output, Ranked, Recommendation, Timings, cluster::cluster_scored, complete_calls, intersect, prune,
-    rerank, rerank_top,
+    Engine, Output, QueryFilter, Ranked, Recommendation, SimilarMatch, Timings, cluster::cluster_scored,
+    complete_calls, intersect, prune, rerank, rerank_top,
 };
 
 fn ms(t: Instant) -> f64 {
@@ -16,6 +17,11 @@ fn ms(t: Instant) -> f64 {
 }
 
 impl Engine {
+    /// The corpus record of method `id`.
+    pub fn method(&self, id: MethodId) -> Option<&MethodRecord> {
+        self.record(id)
+    }
+
     fn record(&self, id: MethodId) -> Option<&MethodRecord> {
         match self.corpus.methods.get(id.0 as usize) {
             Some(r) if r.id == id => Some(r),
@@ -37,12 +43,16 @@ impl Engine {
     }
 
     /// Whether method `id` may be retrieved for a `lang` query: its language is
-    /// in the query's family ([`lang_compatible`]) and it is not in `exclude`.
+    /// in the query's family ([`lang_compatible`]) and `filter` admits it.
     /// Applied to Phase I *before* the η1 cut, so in a mixed-language index
     /// other languages never take candidate slots and clusters never mix
-    /// languages.
-    fn admissible(&self, lang: Lang, exclude: &[MethodId], id: MethodId) -> bool {
-        self.record(id).is_some_and(|r| lang_compatible(lang, r.lang)) && !exclude.contains(&id)
+    /// languages; likewise for filtered-out scopes, ids and paths.
+    fn admissible(&self, lang: Lang, filter: Option<&CompiledFilter>, id: MethodId) -> bool {
+        self.record(id).is_some_and(|r| lang_compatible(lang, r.lang) && filter.is_none_or(|f| f.admits(r)))
+    }
+
+    fn compile(&self, filter: &QueryFilter) -> Option<CompiledFilter> {
+        (!filter.is_trivial()).then(|| filter.compile(&self.corpus, self.root.as_deref()))
     }
 
     /// Re-parses a Phase I candidate (methods that fail to parse are skipped).
@@ -59,8 +69,15 @@ impl Engine {
 
     /// Phases I and II, keeping the exact top `k` of the reranked list
     /// (see [`rerank_top`]); returns `(ranked, candidates parsed)`.
-    fn ranked_top(&self, lang: Lang, fq: &FeatureBag, fq_full: &FeatureBag, k: usize) -> (Vec<Ranked>, usize) {
-        let hits = self.index.search_bounded_where(fq, self.params.eta1, |id| self.admissible(lang, &[], id));
+    fn ranked_top(
+        &self,
+        lang: Lang,
+        fq: &FeatureBag,
+        fq_full: &FeatureBag,
+        k: usize,
+        filter: Option<&CompiledFilter>,
+    ) -> (Vec<Ranked>, usize) {
+        let hits = self.index.search_bounded_where(fq, self.params.eta1, |id| self.admissible(lang, filter, id));
         let full = self.index.resolve(fq_full);
         // Pre-load tie-break bound: full_sim ≤ Σ_f min(F_full(q)_f, m_f).
         rerank_top(fq, fq_full, hits, k, None, self.featurizer.as_ref(), |id| self.load_tree(id), |id| full.bound(id))
@@ -75,7 +92,41 @@ impl Engine {
     /// [`search`](Self::search) for already computed query features
     /// ([`query_feature_pair`](Self::query_feature_pair)).
     pub fn search_features(&self, lang: Lang, fq: &FeatureBag, fq_full: &FeatureBag, n: usize) -> Vec<Ranked> {
-        self.ranked_top(lang, fq, fq_full, n).0
+        self.ranked_top(lang, fq, fq_full, n, None).0
+    }
+
+    /// [`search`](Self::search) over the methods `filter` admits (applied
+    /// before the η1 cut).
+    pub fn search_filtered(&self, lang: Lang, snippet: &str, n: usize, filter: &QueryFilter) -> anyhow::Result<Vec<Ranked>> {
+        let (fq, fq_full) = self.query_feature_pair(lang, snippet)?;
+        Ok(self.ranked_top(lang, &fq, &fq_full, n, self.compile(filter).as_ref()).0)
+    }
+
+    /// Structural similarity search for agents: the top `n` methods `filter`
+    /// admits, ranked like [`search`](Self::search), with metadata, a
+    /// `path:line` citation and the method source.
+    pub fn find_similar(&self, lang: Lang, snippet: &str, n: usize, filter: &QueryFilter) -> anyhow::Result<Vec<SimilarMatch>> {
+        Ok(self
+            .search_filtered(lang, snippet, n, filter)?
+            .into_iter()
+            .filter_map(|r| {
+                let m = self.record(r.id)?;
+                Some(SimilarMatch {
+                    id: r.id,
+                    name: m.name.to_string(),
+                    path: m.rel_path(),
+                    line_start: m.line_start,
+                    line_end: m.line_end(),
+                    provenance: m.provenance(),
+                    lang: m.lang,
+                    is_test: m.is_test,
+                    score: r.score,
+                    sim: r.sim,
+                    overlap: r.overlap,
+                    snippet: m.text.to_string(),
+                })
+            })
+            .collect())
     }
 
     /// Phases I and II over all η1 candidates, re-parsing every one of them
@@ -84,7 +135,7 @@ impl Engine {
         let (fq, fq_full) = self.query_feature_pair(lang, snippet)?;
         let cands: Vec<(MethodId, u32, SimplifiedTree)> = self
             .index
-            .search_where(&fq, self.params.eta1, |id| self.admissible(lang, &[], id))
+            .search_where(&fq, self.params.eta1, |id| self.admissible(lang, None, id))
             .into_par_iter()
             .filter_map(|(id, overlap)| Some((id, overlap, self.load_tree(id)?)))
             .collect();
@@ -98,7 +149,7 @@ impl Engine {
         let fq = self.query_features(lang, snippet)?;
         Ok(self
             .index
-            .search_where(&fq, n, |id| self.admissible(lang, &[], id))
+            .search_where(&fq, n, |id| self.admissible(lang, None, id))
             .into_iter()
             .map(|(id, _)| id)
             .collect())
@@ -107,7 +158,7 @@ impl Engine {
     /// Lexical BM25 baseline over methods in `lang`'s family.
     pub fn bm25_search(&self, lang: Lang, snippet: &str, n: usize) -> Vec<MethodId> {
         self.bm25
-            .search_where(snippet, n, |id| self.admissible(lang, &[], id))
+            .search_where(snippet, n, |id| self.admissible(lang, None, id))
             .into_iter()
             .map(|(id, _)| id)
             .collect()
@@ -122,8 +173,16 @@ impl Engine {
     /// Phase I, before the η1 cut: they never reach N2, clustering, Jaccard
     /// dedup or the top-k (leave-one-out evaluation of a method's own snippet).
     pub fn recommend_excluding(&self, lang: Lang, snippet: &str, exclude: &[MethodId]) -> anyhow::Result<Output> {
+        self.recommend_filtered(lang, snippet, &QueryFilter::new().exclude_ids(exclude.iter().copied()))
+    }
+
+    /// [`recommend`](Self::recommend) over the methods `filter` admits: scope,
+    /// excluded ids and excluded paths are applied in Phase I before the η1
+    /// cut, so they never take an N2, cluster, dedup or top-k slot.
+    pub fn recommend_filtered(&self, lang: Lang, snippet: &str, filter: &QueryFilter) -> anyhow::Result<Output> {
         let featurizer = self.featurizer.as_ref();
         let start = Instant::now();
+        let compiled = self.compile(filter);
 
         let t = Instant::now();
         let (fq, fq_full) = self.query_feature_pair(lang, snippet)?;
@@ -133,7 +192,7 @@ impl Engine {
         // first η2 candidates with score > τ1, a prefix of the ranking), so N2
         // is computed only that far.
         let t = Instant::now();
-        let hits = self.index.search_bounded_where(&fq, self.params.eta1, |id| self.admissible(lang, exclude, id));
+        let hits = self.index.search_bounded_where(&fq, self.params.eta1, |id| self.admissible(lang, compiled.as_ref(), id));
         let phase1_ms = ms(t);
 
         let t = Instant::now();
