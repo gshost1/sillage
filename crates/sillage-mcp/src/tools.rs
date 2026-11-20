@@ -136,6 +136,7 @@ pub fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "code": { "type": "string", "description": "The code under test, ideally the complete function." },
+                    "path": { "type": "string", "maxLength": MAX_PATH_BYTES, "description": "The code's file path relative to the corpus root (as in citations). Ties tests to generic function names (`choose`, `run`)." },
                     "lang": lang,
                     "corpus": corpus,
                     "exclude_path": exclude,
@@ -251,6 +252,7 @@ struct GuardArgs {
 #[derive(Debug, Deserialize)]
 struct TestIdiomArgs {
     code: String,
+    path: Option<String>,
     lang: String,
     corpus: Option<String>,
     exclude_path: Option<Paths>,
@@ -633,7 +635,10 @@ fn find_test_idioms(reg: &CorpusRegistry, a: TestIdiomArgs) -> ToolResult {
     let excl = exclude_paths(a.exclude_path)?;
     let max_lines = clamp(a.max_lines, TEST_LINES, MIN_MAX_LINES, MAX_MAX_LINES);
     let h = corpus(reg, a.corpus.as_deref())?;
-    let opts = TestIdiomOptions { filter: QueryFilter::new().exclude_paths(excl), ..TestIdiomOptions::default() };
+    if let Some(p) = &a.path {
+        check_size("path", p, MAX_PATH_BYTES)?;
+    }
+    let opts = TestIdiomOptions { filter: QueryFilter::new().exclude_paths(excl), path: a.path, ..TestIdiomOptions::default() };
     let ti = h.engine().find_test_idioms(lang, &a.code, &opts).map_err(|e| format!("{e:#}"))?;
     if ti.tests.is_empty() {
         return Ok(format!("No repo tests to model on in corpus `{}` for this {lang} code.", h.name()));

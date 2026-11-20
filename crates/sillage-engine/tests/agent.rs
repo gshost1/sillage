@@ -340,3 +340,95 @@ fn deeply_nested_snippets_align_without_overflow() {
     let al = render_aligned(&draft, &q, &rec, &keep, &AromaFeaturizer);
     assert!(!al.code.is_empty());
 }
+
+const CHOOSE: &str = "pub fn choose(row: &ComboRow, wanted: &str) -> Option<usize> {
+    let mut best = None;
+    for (i, entry) in row.entries.iter().enumerate() {
+        if entry.label == wanted {
+            best = Some(i);
+            break;
+        }
+    }
+    best
+}
+";
+
+/// A repo with two unrelated `choose` functions and tests of each.
+fn choose_repo(root: &Path) {
+    write(
+        root,
+        "src/select_combo_row.rs",
+        &format!("pub struct Entry {{ pub label: String }}\npub struct ComboRow {{ pub entries: Vec<Entry> }}\n\n{CHOOSE}"),
+    );
+    write(
+        root,
+        "src/window_lookup.rs",
+        "pub fn choose(ids: &[u32], titles: &[&str], title: &str) -> Option<u32> {\n    ids.iter().zip(titles).find(|(_, t)| t.contains(title)).map(|(id, _)| *id)\n}\n",
+    );
+    write(
+        root,
+        "tests/window_lookup_tests.rs",
+        "use app::window_lookup;\n\n#[test]\nfn picks_window_by_title() {\n    let got = window_lookup::choose(&[1, 2], &[\"a\", \"b\"], \"b\");\n    assert_eq!(got, Some(2));\n}\n",
+    );
+    write(
+        root,
+        "src/select_combo_row_tests.rs",
+        "use super::*;\n\n#[test]\nfn picks_matching_entry() {\n    let got = choose(&sample(), \"b\");\n    assert_eq!(got, Some(1));\n}\n",
+    );
+}
+
+#[test]
+fn generic_draft_names_need_corroboration() {
+    let dir = tempfile::tempdir().unwrap();
+    choose_repo(dir.path());
+    let e = engine(dir.path(), Params::repo_preset());
+    let names = |ti: &sillage_engine::TestIdioms| -> Vec<(String, TestLink)> {
+        ti.tests.iter().map(|t| (t.test.name.clone(), t.via)).collect()
+    };
+
+    // The draft is in the corpus: its path corroborates its own test file.
+    let ti = e.find_test_idioms(Lang::Rust, CHOOSE, &TestIdiomOptions::default()).unwrap();
+    let got = names(&ti);
+    assert!(got.contains(&("picks_matching_entry".into(), TestLink::ReferencesDraft)), "{got:?}");
+    assert!(got.iter().all(|(n, _)| n != "picks_window_by_title"), "unrelated `window_lookup::choose` test: {got:?}");
+
+    // A new draft (not in the corpus) with an explicit path.
+    let draft = CHOOSE.replace("break;", "return best;");
+    let opts = TestIdiomOptions { path: Some("src/select_combo_row.rs".into()), ..TestIdiomOptions::default() };
+    let got = names(&e.find_test_idioms(Lang::Rust, &draft, &opts).unwrap());
+    assert!(got.contains(&("picks_matching_entry".into(), TestLink::ReferencesDraft)), "{got:?}");
+    assert!(got.iter().all(|(n, _)| n != "picks_window_by_title"), "{got:?}");
+
+    // No path: the name alone links nothing.
+    let got = names(&e.find_test_idioms(Lang::Rust, &draft, &TestIdiomOptions::default()).unwrap());
+    assert!(got.iter().all(|(n, v)| n != "picks_window_by_title" && *v != TestLink::ReferencesDraft), "{got:?}");
+
+    // A distinctive type of the draft in the test corroborates the name.
+    write(
+        dir.path(),
+        "tests/combo_behaviour.rs",
+        "#[test]\nfn combo_rows_pick_by_label() {\n    let row = ComboRow { entries: vec![] };\n    assert_eq!(choose(&row, \"x\"), None);\n}\n",
+    );
+    let e = engine(dir.path(), Params::repo_preset());
+    let got = names(&e.find_test_idioms(Lang::Rust, &draft, &TestIdiomOptions::default()).unwrap());
+    assert!(got.contains(&("combo_rows_pick_by_label".into(), TestLink::ReferencesDraft)), "{got:?}");
+    assert!(got.iter().all(|(n, _)| n != "picks_window_by_title"), "{got:?}");
+}
+
+#[test]
+fn distinctive_draft_names_match_by_name_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/act/hit_test.rs", "pub(crate) fn confirm_hit(x: i32, y: i32) -> bool {\n    x >= 0 && y >= 0\n}\n");
+    write(
+        dir.path(),
+        "tests/unrelated_place.rs",
+        "#[test]\nfn hits_inside() {\n    assert!(confirm_hit(1, 2));\n}\n",
+    );
+    let e = engine(dir.path(), Params::repo_preset());
+    let draft = "fn confirm_hit(px: i32, py: i32) -> bool {\n    let ok = px >= 0;\n    ok && py >= 0\n}\n";
+    let ti = e.find_test_idioms(Lang::Rust, draft, &TestIdiomOptions::default()).unwrap();
+    let t = ti.tests.iter().find(|t| t.test.name == "hits_inside").expect("distinctive name links directly");
+    assert_eq!(t.via, TestLink::ReferencesDraft);
+    // The prod module named `hit_test.rs` is not test code.
+    assert!(ti.tests.iter().all(|t| t.test.name != "confirm_hit"));
+}

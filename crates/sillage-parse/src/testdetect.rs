@@ -19,7 +19,17 @@ pub fn is_test_path(lang: Lang, path: &str) -> bool {
     let dir_is = |names: &[&str]| dirs.iter().any(|d| names.contains(d));
     let stem = file.rsplit_once('.').map_or(file, |(s, _)| s);
     match lang {
-        Lang::Rust => dir_is(&["tests", "benches"]) || stem.ends_with("_test") || stem.ends_with("_tests") || stem == "tests",
+        // Singular `*_test.rs` under `src/` is ambiguous in Rust: `hit_test.rs`,
+        // `self_test.rs`, `smoke_test.rs` are usually production modules. There
+        // only `#[test]` / `#[cfg(test)]` markers (see `is_test_method` and
+        // extraction's `test_context`) make the code test code.
+        Lang::Rust => {
+            dir_is(&["tests", "benches"])
+                || stem == "tests"
+                || stem.ends_with("_tests")
+                || (stem.starts_with("test_") && stem.len() > 5)
+                || (stem.ends_with("_test") && !dir_is(&["src"]))
+        }
         Lang::Go => file.ends_with("_test.go"),
         Lang::Java => {
             dirs.windows(2).any(|w| w[0] == "src" && matches!(w[1], "test" | "androidTest" | "testFixtures" | "integrationTest"))

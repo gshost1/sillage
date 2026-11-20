@@ -236,11 +236,17 @@ pub struct TestIdiomOptions {
     pub max_results: usize,
     #[serde(default)]
     pub existing_imports: Vec<String>,
+    /// The draft's file path (relative to the corpus root, like citations).
+    /// Corroborates name-only links for generic function names (`choose`,
+    /// `run`); when unset, the path of a corpus method with the draft's body
+    /// is used.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 impl Default for TestIdiomOptions {
     fn default() -> Self {
-        Self { filter: QueryFilter::default(), peers: 5, min_score: 0.4, max_results: 5, existing_imports: Vec::new() }
+        Self { filter: QueryFilter::default(), peers: 5, min_score: 0.4, max_results: 5, existing_imports: Vec::new(), path: None }
     }
 }
 
@@ -709,6 +715,56 @@ impl Engine {
         tests.iter().copied().filter(|t| has_word(&t.text, name)).collect()
     }
 
+    /// Paths of the draft: `explicit`, else the files of production methods
+    /// named `name` whose body is the draft's.
+    fn draft_paths(&self, lang: Lang, d: &Draft, explicit: Option<&str>) -> Vec<String> {
+        if let Some(p) = explicit.map(|p| p.trim().replace('\\', "/")).filter(|p| !p.is_empty()) {
+            return vec![p.trim_start_matches("./").to_string()];
+        }
+        let Some(name) = d.name.as_deref() else { return Vec::new() };
+        let me = squash_body(&d.query);
+        let mut paths: Vec<String> = self
+            .corpus
+            .methods
+            .iter()
+            .filter(|m| !m.is_test && &*m.name == name && lang_compatible(lang, m.lang) && squash_body(m.body_text()) == me)
+            .map(MethodRecord::rel_path)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Identifiers of `text` specific enough to tie a test to it: type-like
+    /// (`ComboRow`) or multi-word (`combo_row`) names that are not language
+    /// staples, not `name` itself, and rare in the corpus.
+    fn marker_identifiers(&self, text: &str, name: &str) -> Vec<String> {
+        let indexed = self.bm25.num_docs() == self.corpus.methods.len();
+        let max_df = (self.corpus.methods.len() / 100).max(3);
+        let mut out: Vec<String> = sillage_index::tokenize(text)
+            .filter(|t| t != name && marker_shaped(t))
+            .collect::<FxHashSet<_>>()
+            .into_iter()
+            .filter(|t| !indexed || self.bm25.docs_with_term(t).nth(max_df).is_none())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Whether a test that mentions a generic function name is about the
+    /// function at `paths` with identifiers `marks`: it lives in a
+    /// corresponding test file or names the function's module, mentions one
+    /// of `marks`, or is structurally similar to the draft.
+    fn corroborated(&self, lang: Lang, t: &MethodRecord, paths: &[String], marks: &[String], similar: &FxHashSet<MethodId>) -> bool {
+        if similar.contains(&t.id) || marks.iter().any(|m| has_word(&t.text, m)) {
+            return true;
+        }
+        let tpath = t.rel_path();
+        paths.iter().any(|p| {
+            corresponding_test_file(lang, p, &tpath) || module_name(p).is_some_and(|m| has_word(&t.text, &m))
+        })
+    }
+
     /// Tests to model a test of `draft` on: tests that call the draft's own
     /// function, tests structurally similar to the draft, and tests of its
     /// production peers (tests that reference a peer by name, or live in the
@@ -730,9 +786,17 @@ impl Engine {
                 *e = (score, link, peer);
             }
         };
-        if let Some(name) = d.name.as_deref().filter(|n| distinctive(n)) {
+        let similar_ids: FxHashSet<MethodId> = similar.iter().map(|r| r.id).collect();
+        if let Some(name) = d.name.as_deref().filter(|n| searchable(n)) {
+            // A generic name (`choose`, `run`) alone does not tie a test to
+            // the draft: it needs a corroborating path, identifier or shape.
+            let corroborate = generic_name(name).then(|| {
+                let paths = self.draft_paths(lang, &d, opts.path.as_deref());
+                (paths, self.marker_identifiers(draft, name))
+            });
             for t in self.tests_mentioning(&tests, name) {
-                if &*t.name != name {
+                let ok = corroborate.as_ref().is_none_or(|(paths, marks)| self.corroborated(lang, t, paths, marks, &similar_ids));
+                if &*t.name != name && ok {
                     offer(t.id, 1.0 + name_bonus(&t.name, name), TestLink::ReferencesDraft, None);
                 }
             }
@@ -743,8 +807,17 @@ impl Engine {
         for p in &peers {
             let Some(pm) = self.method(p.id) else { continue };
             let peer_path = pm.rel_path();
-            let mentions: FxHashSet<MethodId> = if distinctive(&pm.name) {
-                self.tests_mentioning(&tests, &pm.name).into_iter().filter(|t| t.name != pm.name).map(|t| t.id).collect()
+            let mentions: FxHashSet<MethodId> = if searchable(&pm.name) {
+                let corroborate = generic_name(&pm.name)
+                    .then(|| (vec![peer_path.clone()], self.marker_identifiers(&pm.text, &pm.name)));
+                self.tests_mentioning(&tests, &pm.name)
+                    .into_iter()
+                    .filter(|t| t.name != pm.name)
+                    .filter(|t| {
+                        corroborate.as_ref().is_none_or(|(paths, marks)| self.corroborated(lang, t, paths, marks, &similar_ids))
+                    })
+                    .map(|t| t.id)
+                    .collect()
             } else {
                 FxHashSet::default()
             };
@@ -836,14 +909,67 @@ fn marked_lines(code: &str, marks: &[&str]) -> Vec<String> {
     code.lines().map(str::trim).filter(|l| !l.is_empty() && marks.iter().any(|m| l.contains(m))).map(str::to_string).collect()
 }
 
-/// A function name specific enough to search tests for.
-fn distinctive(name: &str) -> bool {
-    const COMMON: &[&str] = &[
-        "new", "get", "set", "run", "main", "init", "from", "into", "call", "test", "len", "default", "clone", "drop",
-        "next", "read", "write", "open", "close", "load", "save", "start", "stop", "parse", "build", "apply", "handle",
-        "update", "create", "delete", "render", "<anonymous>", "__init__", "constructor", "setUp", "tearDown",
-    ];
-    name.len() >= 4 && !COMMON.contains(&name)
+/// Function names shared by unrelated code all over a repo (verbs, trait
+/// and CRUD methods): a test mentioning one is not, by name alone, a test of
+/// the draft. Compared case-insensitively.
+const GENERIC_NAMES: &[&str] = &[
+    "new", "run", "act", "get", "set", "choose", "open", "close", "read", "write", "build", "parse", "check", "call",
+    "exec", "handle", "update", "apply", "load", "save", "init", "next", "send", "recv", "start", "stop", "find",
+    "clear", "push", "pop", "default", "from", "into", "clone", "drop", "fmt", "main", "test", "step", "eval", "visit",
+    "render", "format", "validate", "process", "execute", "create", "delete", "remove", "insert", "fetch", "query",
+    "search", "select", "click", "focus", "wait", "reset", "verify", "assert", "matches", "len", "pick", "resolve",
+    "convert", "transform", "invoke", "dispatch", "emit", "list", "show", "hide", "add", "sub", "put", "post", "size",
+    "value", "name", "kind", "with", "make", "setup", "teardown", "cleanup", "finish", "done", "poll", "flush", "sync",
+];
+
+/// A function name too generic to tie a test to code by name alone.
+fn generic_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    name.chars().count() <= 3 || GENERIC_NAMES.contains(&lower.as_str())
+}
+
+/// A function name worth searching tests for at all (corroborated when generic).
+fn searchable(name: &str) -> bool {
+    !matches!(name, "<anonymous>" | "__init__" | "constructor" | "setUp" | "tearDown") && !name.is_empty()
+}
+
+/// Identifiers too common to tie a test to code (`String`, `to_string`).
+const STAPLE_IDENTS: &[&str] = &[
+    "String", "Vec", "Option", "Result", "Some", "None", "Box", "Self", "HashMap", "HashSet", "BTreeMap", "BTreeSet",
+    "VecDeque", "Arc", "Rc", "RefCell", "Cell", "Mutex", "RwLock", "Error", "Default", "Clone", "Debug", "Display",
+    "Iterator", "Into", "From", "True", "False", "Object", "List", "Map", "Set", "Integer", "Long", "Boolean", "Promise",
+    "Array", "Exception", "Context", "Duration", "Instant", "Path", "PathBuf", "Value", "Number", "Date", "Optional",
+    "Override", "Test", "TestCase", "Any", "Dict", "Tuple", "Type", "Function", "Record", "Partial", "Readonly",
+    "to_string", "as_str", "unwrap_or", "unwrap_or_else", "unwrap_or_default", "is_some", "is_none", "is_empty", "is_ok",
+    "is_err", "map_err", "and_then", "ok_or", "ok_or_else", "to_owned", "as_ref", "as_mut", "into_iter", "iter_mut",
+    "for_each", "filter_map", "flat_map", "with_capacity", "to_vec", "starts_with", "ends_with", "split_once",
+    "to_lowercase", "to_uppercase", "trim_start", "trim_end", "as_bytes", "push_str", "get_mut", "contains_key",
+    "or_insert", "or_default", "sort_by", "sort_by_key", "max_by_key", "min_by_key", "take_while", "skip_while",
+    "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "__init__", "__name__", "__main__", "is_some_and",
+    "is_none_or", "unwrap_err", "expect_err", "as_deref", "into_inner",
+];
+
+/// Identifier shapes [`Engine::marker_identifiers`] keeps: an uppercase-led
+/// name with a lowercase letter (a type, ≥ 4 chars) or a `_`-joined name
+/// (≥ 6 chars) whose words are not all generic, and not a staple.
+fn marker_shaped(t: &str) -> bool {
+    let first = t.chars().next().unwrap_or('0');
+    if !(first.is_alphabetic() || first == '_') || STAPLE_IDENTS.contains(&t) || generic_name(t) {
+        return false;
+    }
+    let type_like = first.is_uppercase() && t.chars().any(char::is_lowercase) && t.chars().count() >= 4;
+    let words: Vec<&str> = t.split('_').filter(|w| !w.is_empty()).collect();
+    let snake = words.len() >= 2 && t.chars().count() >= 6 && !words.iter().all(|w| generic_name(w));
+    type_like || snake
+}
+
+/// The module name a path's file stands for (`select_combo_row` for
+/// `src/select_combo_row.rs`, `store` for `store/mod.rs`), unless generic.
+fn module_name(path: &str) -> Option<String> {
+    let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
+    let stem = file.split_once('.').map_or(file, |(s, _)| s);
+    let m = if matches!(stem, "mod" | "__init__" | "index") { dir.rsplit('/').next().unwrap_or("") } else { stem };
+    (!m.is_empty() && !GENERIC_STEMS.contains(&m) && m != "src" && !generic_name(m)).then(|| m.to_string())
 }
 
 /// Bonus when a test's name contains the function's name (`TestParseConfig`, `test_parse_config`).
@@ -963,7 +1089,8 @@ mod tests {
         assert!(corresponding_test_file(Lang::Rust, "src/store.rs", "src/store.rs"));
         assert!(corresponding_test_file(Lang::Rust, "src/store.rs", "tests/store.rs"));
         assert!(!corresponding_test_file(Lang::Python, "app/store.py", "tests/test_other.py"));
-        assert!(distinctive("parse_config") && !distinctive("new") && !distinctive("get"));
+        assert!(!generic_name("parse_config") && generic_name("new") && generic_name("Get") && generic_name("choose"));
+        assert!(!generic_name("confirm_hit") && !generic_name("ensure_ready") && generic_name("ab"));
         // M6: generic stems never pair across unrelated directories.
         assert!(!corresponding_test_file(Lang::Rust, "a/mod.rs", "b/mod.rs"));
         assert!(!corresponding_test_file(Lang::Rust, "x/src/lib.rs", "y/tests/lib.rs"));

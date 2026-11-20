@@ -137,7 +137,9 @@ fn relevant_imports_skips_what_the_caller_already_has() {
 fn test_paths_by_language() {
     let yes = [
         (Lang::Rust, "tests/integration.rs"),
-        (Lang::Rust, "/repo/src/foo_test.rs"),
+        (Lang::Rust, "src/foo_tests.rs"),
+        (Lang::Rust, "src/test_support.rs"),
+        (Lang::Rust, "benches/foo_test.rs"),
         (Lang::Rust, "src/foo/tests.rs"),
         (Lang::Go, "pkg/server_test.go"),
         (Lang::Java, "src/test/java/a/Foo.java"),
@@ -158,6 +160,13 @@ fn test_paths_by_language() {
     let no = [
         (Lang::Rust, "src/contest.rs"),
         (Lang::Rust, "src/attestation/mod.rs"),
+        // Singular `*_test.rs` under `src/` is a domain module in Rust.
+        (Lang::Rust, "/repo/src/foo_test.rs"),
+        (Lang::Rust, "crates/tabref-page/src/act/hit_test.rs"),
+        (Lang::Rust, "crates/linux/src/tree/hit_test/live_world.rs"),
+        (Lang::Rust, "src/self_test.rs"),
+        (Lang::Rust, "src/testing.rs"),
+        (Lang::Rust, "src/test_.rs"),
         (Lang::Go, "pkg/testing_utils.go"),
         (Lang::Java, "src/main/java/a/Testimony.java"),
         (Lang::Java, "src/main/java/a/Latest.java"),
@@ -204,4 +213,39 @@ fn extraction_marks_out_of_text_test_context() {
     let java = "class FooTest { void helper() { int x = 1; } }\nclass Foo { void prod() { int y = 2; } }\n";
     let ctx: Vec<(String, bool)> = extract_methods(Lang::Java, java).into_iter().map(|m| (m.name.to_string(), m.test_context)).collect();
     assert_eq!(ctx, [("helper".into(), true), ("prod".into(), false)]);
+}
+
+/// `is_test` as the corpus computes it: extraction context or path/name/text markers.
+fn rust_is_test(path: &str, src: &str) -> Vec<(String, bool)> {
+    extract_methods(Lang::Rust, src)
+        .into_iter()
+        .map(|m| {
+            let text = &src[m.text_span.start as usize..m.text_span.end as usize];
+            let t = m.test_context || is_test_method(Lang::Rust, path, &m.name, text);
+            (m.name.to_string(), t)
+        })
+        .collect()
+}
+
+#[test]
+fn rust_singular_test_stems_are_prod_unless_marked() {
+    let hit = "pub(crate) fn confirm_hit(x: i32, y: i32) -> bool {\n    x >= 0 && y >= 0\n}\n";
+    assert_eq!(rust_is_test("crates/tabref-page/src/act/hit_test.rs", hit), [("confirm_hit".into(), false)]);
+    assert_eq!(rust_is_test("gshost1/tabref/crates/tabref-page/src/act/hit_test.rs", hit), [("confirm_hit".into(), false)]);
+    let live = "pub fn live_world() -> u8 { 1 }\n";
+    assert_eq!(rust_is_test("crates/linux/src/tree/hit_test/live_world.rs", live), [("live_world".into(), false)]);
+
+    let helper = "fn make_folder() -> u8 { 1 }\n";
+    assert_eq!(rust_is_test("crates/tabref/src/commands/download_folder_tests.rs", helper), [("make_folder".into(), true)]);
+    assert_eq!(rust_is_test("crates/tabref/tests/live_downloads_daemon.rs", helper), [("make_folder".into(), true)]);
+
+    let marked = "#[test]\nfn it_works() { assert!(true); }\n";
+    assert_eq!(rust_is_test("src/foo_test.rs", marked), [("it_works".into(), true)]);
+    let cfg = "#[cfg(test)]\nmod tests {\n    fn helper() -> u8 { 2 }\n}\n";
+    assert_eq!(rust_is_test("src/foo_test.rs", cfg), [("helper".into(), true)]);
+    let inline = "pub fn prod() -> u8 { 1 }\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n    #[test]\n    fn it_works() {}\n}\n";
+    assert_eq!(
+        rust_is_test("src/foo.rs", inline),
+        [("prod".into(), false), ("helper".into(), true), ("it_works".into(), true)]
+    );
 }
