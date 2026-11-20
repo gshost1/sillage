@@ -1,0 +1,19 @@
+[package]
+name = "sillage-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sillage-core.workspace = true
+sillage-parse.workspace = true
+sillage-index.workspace = true
+anyhow.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true

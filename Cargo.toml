@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sillage-core",
+    "crates/sillage-parse",
+    "crates/sillage-index",
+    "crates/sillage-engine",
+    "crates/sillage-render",
+    "crates/sillage-bench",
+    "crates/sillage-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/gshost1/sillage"
+description = "Clean-room Rust remake of Aroma (OOPSLA'19): structural code search and cluster-and-intersect code recommendation"
+
+[workspace.dependencies]
+# Workspace crates
+sillage-core = { path = "crates/sillage-core" }
+sillage-parse = { path = "crates/sillage-parse" }
+sillage-index = { path = "crates/sillage-index" }
+sillage-engine = { path = "crates/sillage-engine" }
+sillage-render = { path = "crates/sillage-render" }
+sillage-bench = { path = "crates/sillage-bench" }
+
+# Parsing
+tree-sitter = "0.25"
+tree-sitter-java = "0.23.5"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go = "0.25.0"
+tree-sitter-rust = "0.24.2"
+
+# Core & indexing
+rayon = "1.12"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rustc-hash = "2.1"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+postcard = { version = "1.1", features = ["use-std"] }
+ignore = "0.4"
+toml = "0.8"
+
+# CLI, rendering, benchmarking
+clap = { version = "4.6", features = ["derive"] }
+similar = "3.2"
+rand = "0.9"
+rand_chacha = "0.9"
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Dev / tests
+proptest = "1.6"
+insta = "1.42"
+tempfile = "3.15"

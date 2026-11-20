@@ -1,0 +1,22 @@
+[package]
+name = "sillage-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sillage"
+path = "src/main.rs"
+
+[dependencies]
+sillage-core.workspace = true
+sillage-parse.workspace = true
+sillage-index.workspace = true
+sillage-engine.workspace = true
+sillage-render.workspace = true
+sillage-bench.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
