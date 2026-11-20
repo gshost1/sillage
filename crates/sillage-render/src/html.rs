@@ -34,7 +34,13 @@ pub fn render(layout: &Layout) -> String {
         };
         out.push_str("<span class=\"");
         out.push_str(class);
-        out.push_str("\">");
+        out.push('"');
+        // File line gutter, once `Layout::locate` has run (CSS can show it with
+        // `.line::before { content: attr(data-line) }`).
+        if let Some(n) = line.file_line {
+            out.push_str(&format!(" data-line=\"{n}\""));
+        }
+        out.push('>');
         out.push_str(&escape(&line.text));
         out.push_str("</span>");
     }

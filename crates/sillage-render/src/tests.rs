@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use sillage_core::{Lang, Node, NodeKind, SimplifiedTree, Span};
 
-use crate::{Style, layout, render};
+use crate::{Style, layout, render, render_layout};
 
 const KEYWORDS: &[&str] = &[
     "try", "catch", "if", "for", "int", "return", "new", "with", "as", "def", "else", "while",
@@ -423,4 +423,49 @@ fn locate_and_truncate() {
     let mut pl = layout(&py, &vec![true; py.leaves.len()], None);
     pl.truncate(1);
     assert!(pl.lines.last().unwrap().text.trim_start().starts_with("... ("), "{:?}", pl.lines);
+}
+
+/// Stage 5: untrusted corpus text cannot inject terminal escape sequences.
+#[test]
+fn ansi_escapes_control_characters() {
+    use crate::layout::{Layout, Line};
+    let line = |text: &str, extra: bool| Line {
+        line_no: 1,
+        text: text.into(),
+        extra,
+        placeholder: false,
+        src_line: Some(1),
+        file_line: None,
+    };
+    let lay = Layout {
+        lang: "java".into(),
+        lines: vec![line("s = \"\x1b[2J\x1b]0;pwn\x07\";", true), line("t = \"a\rb\u{9b}31m\tc\";", false)],
+        diff: None,
+    };
+    let out = render_layout(&lay, Style::Ansi);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "\x1b[1;32m+ s = \"\\x1b[2J\\x1b]0;pwn\\x07\";\x1b[0m");
+    assert_eq!(lines[1], "  t = \"a\\x0db\\u{9b}31m\tc\";");
+    // Only our own SGR sequences remain.
+    assert_eq!(out.matches('\x1b').count(), 2);
+    assert_eq!(crate::ansi::sanitize("plain\ttext"), "plain\ttext");
+}
+
+/// Stage 5: a located layout gets a right-aligned file-line gutter in ANSI and
+/// `data-line` attributes in HTML; placeholders get a blank gutter.
+#[test]
+fn located_layout_shows_file_lines() {
+    let full = build(Lang::Java, JAVA);
+    let (tree, qm) = prune(&full, &[5, 7], &[4, 6]);
+    let mut lay = layout(&tree, &qm, None);
+    lay.locate(98);
+    let ansi = render_layout(&lay, Style::Ansi);
+    let lines: Vec<&str> = ansi.lines().collect();
+    let first = lay.lines[0].file_line.unwrap();
+    assert_eq!(lines[0], format!("{first:>3}   try {{"));
+    let ph = lay.lines.iter().position(|l| l.placeholder).unwrap();
+    assert!(lines[ph].starts_with("    \x1b[36m+ "), "{:?}", lines[ph]);
+    let html = render_layout(&lay, Style::Html);
+    assert!(html.contains(&format!("<span class=\"line matched\" data-line=\"{first}\">try {{</span>")), "{html}");
+    assert!(html.contains("<span class=\"line extra placeholder\">"), "{html}");
 }
