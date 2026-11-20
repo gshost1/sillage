@@ -347,25 +347,55 @@ pub(crate) fn parse_snippet(lang: Lang, s: &str) -> Result<SimplifiedTree> {
     //
     // Missing operands get holes first (see `holes`): `x =` reads `#=#` and a
     // leading-dot `.build();` reads `#.#()`, as in the complete code.
-    let cl = closers(lang, s);
-    let holes = holes(lang, s);
-    let mut candidates = Vec::with_capacity(pairs.len() * 3 + 2);
-    for &(prefix, suffix) in pairs {
-        if !holes.is_empty() {
-            candidates.push(Wrapped::with_holes(prefix, s, &holes, &cl, suffix));
-        }
-        if !cl.is_empty() {
-            candidates.push(Wrapped::closed(prefix, s, &cl, suffix));
-        }
-        candidates.push(Wrapped::around(prefix, s, suffix));
+    //
+    // Python: an odd number of triple quotes means one end of a multi-line string
+    // (`"""` alone, or `conftest="""`) was sampled without the other; left in,
+    // it opens a string that swallows the rest of the query. A variant with the
+    // odd lines blanked (same length, so spans are unchanged) is tried first.
+    let mut variants: Vec<std::borrow::Cow<'_, str>> = Vec::with_capacity(2);
+    if lang == Lang::Python
+        && let Some(blanked) = blank_open_triple_quotes(s)
+    {
+        variants.push(blanked.into());
     }
-    if lang == Lang::Python {
-        if !cl.is_empty() {
-            candidates.push(Wrapped::python_block_closed(s, &cl));
+    variants.push(s.into());
+    let mut candidates = Vec::with_capacity(variants.len() * (pairs.len() * 3 + 2));
+    for v in &variants {
+        let v: &str = v;
+        let cl = closers(lang, v);
+        let holes = holes(lang, v);
+        for &(prefix, suffix) in pairs {
+            if !holes.is_empty() {
+                candidates.push(Wrapped::with_holes(prefix, v, &holes, &cl, suffix));
+            }
+            if !cl.is_empty() {
+                candidates.push(Wrapped::closed(prefix, v, &cl, suffix));
+            }
+            candidates.push(Wrapped::around(prefix, v, suffix));
         }
-        candidates.push(Wrapped::python_block(s));
+        if lang == Lang::Python {
+            if !cl.is_empty() {
+                candidates.push(Wrapped::python_block_closed(v, &cl));
+            }
+            candidates.push(Wrapped::python_block(v));
+        }
     }
     parse_best(lang, s, candidates, true)
+}
+
+/// When `s` holds an odd number of `"""`/`'''` (a multi-line string is left
+/// open), `s` with every line holding an odd number of them replaced by spaces.
+fn blank_open_triple_quotes(s: &str) -> Option<String> {
+    let count = |l: &str| l.matches("\"\"\"").count() + l.matches("'''").count();
+    let odd = |l: &str| count(l) % 2 == 1;
+    if count(s) % 2 == 0 {
+        return None;
+    }
+    let out: Vec<String> = s
+        .split('\n')
+        .map(|l| if odd(l) { " ".repeat(l.len()) } else { l.to_string() })
+        .collect();
+    Some(out.join("\n"))
 }
 
 /// Closers for the brackets `s` leaves open, innermost first (e.g. `)}` for

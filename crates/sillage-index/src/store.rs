@@ -9,7 +9,8 @@ use crate::{Bm25, Corpus, InvertedIndex};
 
 const MAGIC: &[u8; 8] = b"SILLAGE1";
 /// 2: postings carry per-method feature counts (`InvertedIndex::counts`).
-pub const FORMAT_VERSION: u32 = 2;
+/// 3: BM25 terms are case-sensitive whole identifiers (`bm25::tokenize`).
+pub const FORMAT_VERSION: u32 = 3;
 const HEADER_LEN: usize = MAGIC.len() + 4;
 
 pub fn save(path: &Path, corpus: &Corpus, index: &InvertedIndex, bm25: &Bm25) -> anyhow::Result<()> {

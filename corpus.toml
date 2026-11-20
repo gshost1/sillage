@@ -1,6 +1,7 @@
 # Sillage corpus manifest. `sillage fetch --manifest corpus.toml --out corpus/`
 # shallow-clones every repo and checks out the pinned `rev` (full commit SHA).
 # `tag` records the release the SHA was resolved from (2026-11-20, `git ls-remote`).
+# Stage 3 added 2 repos per non-Java language (Table 5 corpora).
 
 # --- Java (paper §4/§5 language) ---------------------------------------------
 
@@ -90,6 +91,20 @@ tag = "8.1.7"
 rev = "874ca2bc1c30d93a4ac6e36a15ed685eafe89097"
 lang = "python"
 
+[[repo]]
+name = "pytest"
+url = "https://github.com/pytest-dev/pytest"
+tag = "8.3.3"
+rev = "d0f136fe64f9374f18a04562305b178fb380d1ec"
+lang = "python"
+
+[[repo]]
+name = "rich"
+url = "https://github.com/Textualize/rich"
+tag = "v13.9.4"
+rev = "43d3b04725ab9731727fb1126e35980c62f32377"
+lang = "python"
+
 # --- JavaScript / TypeScript -------------------------------------------------
 
 [[repo]]
@@ -104,6 +119,34 @@ name = "zod"
 url = "https://github.com/colinhacks/zod"
 tag = "v3.23.8"
 rev = "ca42965df46b2f7e2747db29c40a26bcb32a51d5"
+lang = "typescript"
+
+[[repo]]
+name = "eslint"
+url = "https://github.com/eslint/eslint"
+tag = "v9.12.0"
+rev = "17cfb684194df48d0a5dc566af9c28fe80ea6d42"
+lang = "javascript"
+
+[[repo]]
+name = "prettier"
+url = "https://github.com/prettier/prettier"
+tag = "3.3.3"
+rev = "52829385bcc4d785e58ae2602c0b098a643523c9"
+lang = "javascript"
+
+[[repo]]
+name = "typeorm"
+url = "https://github.com/typeorm/typeorm"
+tag = "0.3.20"
+rev = "3d55188c0dd1256f520143379ecf97f45e71acba"
+lang = "typescript"
+
+[[repo]]
+name = "nest"
+url = "https://github.com/nestjs/nest"
+tag = "v10.4.4"
+rev = "5ae7e0f21414c907988ccb4798edee1a677e8554"
 lang = "typescript"
 
 # --- Go --------------------------------------------------------------------------
@@ -122,6 +165,20 @@ tag = "v1.8.1"
 rev = "b4617d0b9670ad14039b2739167fd35a60f557c5"
 lang = "go"
 
+[[repo]]
+name = "gin"
+url = "https://github.com/gin-gonic/gin"
+tag = "v1.10.0"
+rev = "75ccf94d605a05fe24817fc2f166f6f2959d5cea"
+lang = "go"
+
+[[repo]]
+name = "caddy"
+url = "https://github.com/caddyserver/caddy"
+tag = "v2.8.4"
+rev = "7088605cc11c52c2777ab613dfc5c2a9816006e4"
+lang = "go"
+
 # --- Rust ------------------------------------------------------------------------
 
 [[repo]]
@@ -136,4 +193,11 @@ name = "serde_json"
 url = "https://github.com/serde-rs/json"
 tag = "v1.0.128"
 rev = "d96b1d9b643b49a0bb92a8cf280daf6aa08f37cc"
+lang = "rust"
+
+[[repo]]
+name = "tokio"
+url = "https://github.com/tokio-rs/tokio"
+tag = "tokio-1.40.0"
+rev = "ea6d652a102dee3f22b490db70545b7f66a23fb7"
 lang = "rust"

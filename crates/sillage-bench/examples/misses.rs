@@ -93,6 +93,21 @@ fn main() -> anyhow::Result<()> {
             None => 4,
         }] += 1;
     }
+    // Fingerprint of the sampled query set, to check that a change keeps the
+    // benchmark's queries byte-identical (apples-to-apples).
+    let fingerprint = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        for q in &queries {
+            (q.orig.0, &q.snippet).hash(&mut h);
+        }
+        h.finish()
+    };
+    println!("query set fingerprint {fingerprint:016x}");
+    if let Some(path) = std::env::var_os("SILLAGE_DUMP") {
+        let all: String = queries.iter().map(|q| format!("=== {}\n{}\n", q.orig.0, q.snippet)).collect();
+        std::fs::write(path, all)?;
+    }
     println!(
         "{} queries, {} R@1 misses ({:.1}%) | orig rank 2: {} | 3-5: {} | 6-10: {} | 11-100: {} | absent: {}",
         queries.len(),

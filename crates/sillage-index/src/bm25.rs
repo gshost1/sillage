@@ -132,49 +132,18 @@ impl Bm25 {
     }
 }
 
-/// Lower-cased identifier/number words. Each identifier also yields its
-/// camelCase / snake_case sub-words (e.g. `getChildCount` → `getchildcount`,
-/// `get`, `child`, `count`). Used identically for documents and queries.
+/// Identifier and number words, case-sensitive and whole (`getChildCount`,
+/// `HTTPServer_v2`). Used identically for documents and queries.
+///
+/// Stage 3 ablation on the Java benchmark (BM25 Recall@1, contiguous /
+/// non-contiguous, n = 1000, seed 7): lower-cased words plus camelCase /
+/// snake_case sub-words 73.2% / 81.0%; lower-cased whole words 73.3% / 81.0%;
+/// sub-words only 68.9% / 79.5%; case-sensitive whole words **74.0% / 81.9%**.
+/// Sub-words dilute IDF with common fragments (`get`, `set`, `test`).
 pub fn tokenize(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
         .filter(|w| !w.is_empty())
-        .flat_map(|w| {
-            let whole = w.to_lowercase();
-            let parts = split_subwords(w);
-            let extra: Vec<String> = if parts.len() > 1 { parts } else { Vec::new() };
-            std::iter::once(whole).chain(extra)
-        })
-}
-
-fn split_subwords(word: &str) -> Vec<String> {
-    let chars: Vec<char> = word.chars().collect();
-    let mut parts = Vec::new();
-    let mut cur = String::new();
-    for (i, &c) in chars.iter().enumerate() {
-        if c == '_' || c == '$' {
-            if !cur.is_empty() {
-                parts.push(std::mem::take(&mut cur));
-            }
-            continue;
-        }
-        let prev = i.checked_sub(1).map(|j| chars[j]);
-        let next = chars.get(i + 1).copied();
-        let boundary = match prev {
-            Some(p) if c.is_uppercase() => {
-                p.is_lowercase() || p.is_numeric() || (p.is_uppercase() && next.is_some_and(char::is_lowercase))
-            }
-            Some(p) => c.is_numeric() != p.is_numeric() && p != '_' && p != '$',
-            None => false,
-        };
-        if boundary && !cur.is_empty() {
-            parts.push(std::mem::take(&mut cur));
-        }
-        cur.extend(c.to_lowercase());
-    }
-    if !cur.is_empty() {
-        parts.push(cur);
-    }
-    parts
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -182,11 +151,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tokenize_splits_identifiers() {
-        let words: Vec<String> = tokenize("x.getChildCount() + HTTPServer_v2;").collect();
-        assert_eq!(
-            words,
-            ["x", "getchildcount", "get", "child", "count", "httpserver_v2", "http", "server", "v", "2"]
-        );
+    fn tokenize_keeps_whole_case_sensitive_identifiers() {
+        let words: Vec<String> = tokenize("x.getChildCount() + HTTPServer_v2; $el = 42").collect();
+        assert_eq!(words, ["x", "getChildCount", "HTTPServer_v2", "$el", "42"]);
     }
 }

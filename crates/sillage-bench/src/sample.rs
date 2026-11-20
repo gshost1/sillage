@@ -5,7 +5,7 @@ use rand::seq::index;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use rayon::prelude::*;
-use sillage_core::{MethodRecord, NodeKind};
+use sillage_core::{Lang, MethodRecord, NodeKind};
 
 /// Paper §5: sampled method bodies have at least 12 lines of code.
 pub const MIN_BODY_LINES: usize = 12;
@@ -40,11 +40,32 @@ pub fn body_lines(body: &str) -> Vec<&str> {
         .collect()
 }
 
+/// A token whose text is a quoted string literal, with an optional prefix
+/// (`"…"`, `'…'`, `f"""…`, `rb'…'`).
+fn is_string_literal(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Token { text, .. } if is_quote_start(text))
+}
+
+fn is_quote_start(text: &str) -> bool {
+    let body = text.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    text.len() - body.len() <= 3 && body.starts_with(['"', '\'', '`'])
+}
+
 /// Lines of a method body that hold code (paper §5: "lines of code"): every line
 /// touched by a terminal of the parsed body, except the body's own outer `{`/`}`.
-/// Comment-only and blank lines are skipped. Lines are full source lines (with
-/// their indentation), clipped to the body span; falls back to [`body_lines`]
-/// when the method does not parse.
+/// Comment-only and blank lines are skipped, and so are the interior lines of a
+/// multi-line string literal (a Python docstring or triple-quoted test fixture,
+/// a Rust raw-string help text): like Javadoc comments they hold no code, and a
+/// query starting inside one parses prose as code (Stage 3: Python Recall@1
+/// 56% → 93%).
+///
+/// Java is exempt only to keep its sampled query sets byte-identical to the
+/// Stage 2 baseline: in the 80k-method Java corpus the rule touches exactly one
+/// method (a JDK 21 text-block test, 12 → 7 code lines), but that one change to
+/// the eligible pool reshuffles the seeded sample.
+///
+/// Lines are full source lines (with their indentation), clipped to the body
+/// span; falls back to [`body_lines`] when the method does not parse.
 pub fn code_lines(m: &MethodRecord) -> Vec<&str> {
     let text: &str = &m.text;
     let (bs, be) = (m.body.start as usize, m.body.end as usize);
@@ -75,8 +96,26 @@ pub fn code_lines(m: &MethodRecord) -> Vec<&str> {
         if !n.children.is_empty() || n.span.is_empty() || skip.contains(&(id as u32)) {
             continue;
         }
-        for l in line_of(n.span.start as usize)..=line_of(n.span.end as usize - 1) {
-            code[l] = true;
+        code[line_of(n.span.start as usize)..=line_of(n.span.end as usize - 1)].fill(true);
+    }
+    if m.lang != Lang::Java {
+        // Interior lines of a multi-line string, atomic (`"""doc"""`) or
+        // structural (an f-string / template literal with interpolations, whose
+        // first child is the opening quote keyword, e.g. `f"""`).
+        for n in &tree.nodes {
+            let string = match &n.kind {
+                NodeKind::Token { .. } => is_string_literal(&n.kind),
+                NodeKind::Internal { .. } => n.children.first().is_some_and(|&c| {
+                    matches!(&tree.node(c).kind, NodeKind::Keyword { text } if is_quote_start(text))
+                }),
+                NodeKind::Keyword { .. } => false,
+            };
+            if string && !n.span.is_empty() {
+                let (first, last) = (line_of(n.span.start as usize), line_of(n.span.end as usize - 1));
+                if last > first + 1 {
+                    code[first + 1..last].fill(false);
+                }
+            }
         }
     }
     (0..starts.len())
@@ -274,6 +313,46 @@ mod tests {
             text: Arc::from(text),
         };
         assert_eq!(code_lines(&py), vec!["    y = x", "    return y"]);
+    }
+
+    fn py_record(text: &str) -> MethodRecord {
+        MethodRecord {
+            id: MethodId(3),
+            lang: Lang::Python,
+            repo: "r".into(),
+            path: "a.py".into(),
+            name: "f".into(),
+            line_start: 1,
+            body: Span::new(text.find(":\n").unwrap() as u32 + 2, text.len() as u32),
+            text: Arc::from(text),
+        }
+    }
+
+    /// Stage 3: interior lines of a multi-line string (docstring, triple-quoted
+    /// fixture, interpolated f-string) are not code lines in Python; its first
+    /// and last lines are. Java keeps every line a terminal touches.
+    #[test]
+    fn code_lines_skip_multiline_string_interiors() {
+        let text = "def f(t):\n    \"\"\"Doc line one.\n    Doc line two.\n    \"\"\"\n    t.make(\n        \"\"\"\n        import x\n        \"\"\"\n    )\n    s = f\"\"\"\n    a {t}\n    b\"\"\"\n    return s";
+        let m = py_record(text);
+        let lines = code_lines(&m);
+        assert_eq!(
+            lines,
+            [
+                "    \"\"\"Doc line one.",
+                "    \"\"\"",
+                "    t.make(",
+                "        \"\"\"",
+                "        \"\"\"",
+                "    )",
+                "    s = f\"\"\"",
+                "    b\"\"\"",
+                "    return s",
+            ]
+        );
+        let body = "{\n    String s = \"\"\"\n        text block\n        \"\"\";\n    use(s);\n}";
+        let j = record(4, body);
+        assert_eq!(code_lines(&j).len(), 4, "Java keeps text-block lines");
     }
 
     #[test]

@@ -41,9 +41,12 @@ fn bm25_ranks_relevant_methods() {
     assert_eq!(ids, [2, 1], "{hits:?}");
     assert!(hits[0].1 > hits[1].1 && hits[1].1 > 0.0);
 
-    // camelCase sub-words match.
-    let hits = bm25.search("child count", 10);
+    // Whole, case-sensitive identifiers (Stage 3): `getChildCount` matches only
+    // itself, not its sub-words or another casing.
+    let hits = bm25.search("getChildCount", 10);
     assert_eq!(hits.first().map(|h| h.0), Some(MethodId(1)));
+    assert!(bm25.search("child count", 10).is_empty());
+    assert!(bm25.search("getchildcount", 10).is_empty());
 
     // Top-n truncation keeps the best.
     assert_eq!(bm25.search("view instanceof ViewGroup", 1).len(), 1);

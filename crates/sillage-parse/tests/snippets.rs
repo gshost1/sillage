@@ -168,3 +168,17 @@ fn explicit_constructor_calls_parse_in_constructor_wrapper() {
     let body = parse_method(Lang::Java, &m[ex.text_span.start as usize..ex.text_span.end as usize], ex.body_span).unwrap();
     assert!(common::labels(&body).iter().any(|l| l == "super(#);"), "{}", common::dump(&body));
 }
+
+/// Python: a snippet with an odd number of triple quotes (one end of a
+/// multi-line string sampled without the other) parses the code around it,
+/// instead of one string swallowing the rest of the snippet; balanced triple
+/// quotes are kept.
+#[test]
+fn python_open_triple_quote_lines_are_blanked() {
+    let t = snippet(Lang::Python, "    \"\"\"\nresult = run(\n    [\n        \"=* 1 passed\",\n)");
+    let toks = common::tokens(&t);
+    assert!(toks.iter().any(|(s, _)| s == "run"), "{}", common::dump(&t));
+    assert!(!toks.iter().any(|(s, _)| s.contains("\"\"\"")), "{}", common::dump(&t));
+    let t = snippet(Lang::Python, "x = \"\"\"\n\"\"\"\ny = x");
+    assert!(common::tokens(&t).iter().any(|(s, _)| s.starts_with("\"\"\"")), "{}", common::dump(&t));
+}
