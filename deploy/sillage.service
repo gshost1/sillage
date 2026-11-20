@@ -1,0 +1,64 @@
+# sillage MCP server (Streamable HTTP) as a hardened systemd service.
+#
+# Install:
+#   sudo install -m 0755 target/release/sillage /usr/local/bin/sillage
+#   sudo useradd --system --home-dir /var/lib/sillage --create-home --shell /usr/sbin/nologin sillage
+#   sudo install -d -m 0750 -o root -g sillage /etc/sillage
+#   echo "SILLAGE_MCP_TOKEN=$(openssl rand -hex 32)" | sudo tee /etc/sillage/sillage.env >/dev/null
+#   sudo chmod 0640 /etc/sillage/sillage.env && sudo chgrp sillage /etc/sillage/sillage.env
+#   sudo install -m 0644 deploy/sillage.service /etc/systemd/system/sillage.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sillage
+#   curl -fsS http://127.0.0.1:8765/healthz
+#
+# The token is read from SILLAGE_MCP_TOKEN in the EnvironmentFile, so it never
+# appears on the command line or in `ps`. Put a TLS-terminating reverse proxy
+# (Caddy, nginx) in front when exposing it beyond localhost.
+
+[Unit]
+Description=sillage MCP server (structural code search for coding agents)
+Documentation=https://github.com/gshost1/sillage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sillage
+Group=sillage
+EnvironmentFile=-/etc/sillage/sillage.env
+# Edit the corpora: each --corpus is name=DIR (indexed live, refreshed every
+# --refresh-interval seconds) or name=FILE.sil (static snapshot).
+ExecStart=/usr/local/bin/sillage serve \
+    --host 127.0.0.1 --port 8765 \
+    --corpus app=/srv/repos/app \
+    --refresh-interval 300
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+
+# Hardening: read-only system, no privilege escalation, private /tmp.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+# Corpora are only read. If they live under /home, use ProtectHome=read-only.
+
+[Install]
+WantedBy=multi-user.target

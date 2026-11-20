@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use sillage_core::{Lang, MethodId, MethodRecord, MethodScope, lang_compatible};
+use sillage_core::{Lang, MethodId, MethodRecord, MethodScope, Params, lang_compatible};
 use sillage_render::Layout;
 
 use crate::align::{Rename, render_aligned};
@@ -478,8 +478,14 @@ impl Engine {
     /// `opts.min_confidence`, are dropped; the rest are ordered by confidence,
     /// then cluster size.
     pub fn find_idioms(&self, lang: Lang, draft: &str, opts: &IdiomOptions) -> anyhow::Result<Vec<Idiom>> {
+        self.find_idioms_with(lang, draft, opts, &self.params)
+    }
+
+    /// [`find_idioms`](Self::find_idioms) with per-call parameters instead of
+    /// [`Engine::params`].
+    pub fn find_idioms_with(&self, lang: Lang, draft: &str, opts: &IdiomOptions, params: &Params) -> anyhow::Result<Vec<Idiom>> {
         let d = split_draft(lang, draft);
-        let out = self.recommend_filtered(lang, &d.query, &opts.filter)?;
+        let out = self.recommend_filtered_with(lang, &d.query, &opts.filter, params)?;
         if out.recommendations.is_empty() {
             return Ok(Vec::new());
         }

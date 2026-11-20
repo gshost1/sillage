@@ -49,6 +49,8 @@ Query fixtures for every language are in `bench/queries/`, for example `viewgrou
 | `sillage stats --index FILE` | Methods per language, repos, features, postings. |
 | `sillage bench recall --index FILE [--n 1000] [--mode contiguous\|noncontiguous] [--bootstrap 1000] [--seed 7] [--json]` | Paper §5 / Table 4: strict and §5 Recall@1 and Recall@100 for BM25, feature search and Sillage, with 95% bootstrap CIs. |
 | `sillage bench quality --index FILE [--n 200] [--seed 7] [--json]` | Paper §4.2: recommendation quality on half-method queries, leave-one-out, with per-phase latency. |
+| `sillage serve [--host H] [--port 8765] [--corpus NAME=PATH]... [--root DIR] [--token T]` | MCP server over Streamable HTTP for web-hosted agents (see [MCP server](#mcp-server-for-coding-agents)). |
+| `sillage mcp [--corpus NAME=PATH]... [--root DIR]` | MCP server over stdio, launched by a local agent. |
 
 **Snippet input.** Pass a file, or `-` / nothing for stdin. The language comes from `--lang` (`java`, `python`/`py`, `javascript`/`js`, `typescript`/`ts`, `tsx`, `go`, `rust`/`rs`). Without `--lang` it is taken from the file extension, mapped as `index` maps corpus files (`.pyi`, `.mjs`, `.mts`, … included). Stdin needs `--lang`, and its absence is reported before stdin is read.
 
@@ -70,6 +72,131 @@ Query fixtures for every language are in `bench/queries/`, for example `viewgrou
 | `--tau1` [0.65] | minimum pruned similarity `sim / \|F(q)\|`, in [0, 1] |
 | `--tau2` [1.5] | minimum cluster extension ratio `l(τ)`, finite ≥ 0 |
 | `--tau3` [0.9] | minimum cluster query alignment `s(τ)`, in [0, 1] |
+
+## MCP server for coding agents
+
+sillage serves its agent tools over the [Model Context Protocol](https://modelcontextprotocol.io) (protocol 2025-06-18 and 2025-03-26). Corpora stay indexed in RAM. A directory corpus is re-indexed incrementally, so only changed files are re-parsed.
+
+```sh
+# Web-hosted (Streamable HTTP): http://HOST:8765/mcp, health at /healthz
+export SILLAGE_MCP_TOKEN=$(openssl rand -hex 32)
+sillage serve --host 0.0.0.0 --port 8765 --root ~/src/app --refresh-interval 120
+
+# Several corpora: live directories and/or prebuilt .sil snapshots
+sillage serve --corpus api=~/src/api --corpus web=~/src/web --corpus java=data/java.sil --default-corpus api
+
+# Local (stdio), launched by the agent inside the repository
+sillage mcp --root .
+```
+
+| Flag (`serve` / `mcp`) | Meaning |
+|---|---|
+| `--corpus NAME=PATH` | A corpus: a directory (indexed live) or a `.sil` file (static). Repeatable. |
+| `--root DIR` | A directory served under its basename and used as the default corpus. With no `--root` or `--corpus`, the current directory is served. |
+| `--default-corpus NAME` | The corpus used when a call names none. Defaults to `--root`, else the first `--corpus`. |
+| `--lang L[,L...]` | Languages indexed in directory corpora. Default: all 7. |
+| `--refresh-interval SECS` | Background incremental refresh. `0`, the default, refreshes only on `refresh_corpus`. |
+| `--host`, `--port` (`serve`) | Bind address. Default `127.0.0.1:8765`. |
+| `--token T` (`serve`) | Requires `Authorization: Bearer T` on `/mcp`. Defaults to `$SILLAGE_MCP_TOKEN`; prefer the variable, because arguments show up in `ps`. The token is compared in constant time and never logged. |
+| `--cors-origin O` (`serve`) | A browser origin allowed to call `/mcp` (repeatable; `*` allows any). Browser requests from any other origin get `403`. Clients that send no `Origin` header (CLI agents) are always allowed. |
+| `--max-body-bytes N` (`serve`) | Request size limit. Default 2 MiB. Larger requests get `413`. |
+
+**Endpoints:**
+- `POST /mcp` takes JSON-RPC: `200` JSON for requests, `202` for notifications.
+- `GET /mcp` opens an SSE keep-alive stream.
+- `DELETE /mcp` ends a session.
+- `OPTIONS /mcp` answers CORS preflights.
+- `GET /healthz` returns `{"status":"ok"}` without auth.
+
+`initialize` issues an `Mcp-Session-Id`. A request that carries a session id that is unknown or was deleted gets `404`. Requests without a session id are served statelessly, because every tool depends only on its arguments. Sessions expire after 1 h idle, and at most 1024 are kept.
+
+### Tools
+
+| Tool | When an agent calls it |
+|---|---|
+| `find_idioms` | After drafting a body or snippet. Returns the repo's consensus completion as a diff in the agent's own variable names (`detail`: `diff`, `compact` or `full`), with confidence, cluster size, `file:line` provenance and the imports the added lines need (`preset`: `repo` or `paper`). |
+| `find_similar_code` | Before writing a helper that may already exist. Finds structurally similar methods (`scope`: `all`, `prod` or `test`), each with `file:line`, a prod/test badge and a score. |
+| `check_missing_guards` | On finished `code` + `lang`, or on a raw `git diff`. Reports only high-confidence error / null / bounds checks, cleanup, logging and validation that a consensus of similar production methods has and the code lacks. Stays silent when it finds none. |
+| `find_test_idioms` | When writing tests. Returns repo tests to model on, with skeletons renamed to the new function, how each test was linked, assertions, fixtures and test imports. |
+| `corpus_status` | Shows what is indexed: method counts (prod / test), files, languages and last refresh. Host paths are never shown. |
+| `refresh_corpus` | After editing files. Runs an incremental re-index and returns files added / modified / removed / unchanged, total methods and elapsed time. |
+
+Every tool except the two corpus tools takes `corpus` (optional) and `exclude_path` (pass the file being edited, so it never matches itself). Inputs are capped: 64 KiB per snippet, 1 MiB per diff, `limit` ≤ 20, `max_lines` ≤ 400.
+
+### Client configuration
+
+Replace `https://sillage.example.com/mcp` with your server's URL and export `SILLAGE_MCP_TOKEN` in the client's environment.
+
+**Claude Code.** Remote:
+
+```sh
+claude mcp add --transport http sillage https://sillage.example.com/mcp \
+  --header "Authorization: Bearer $SILLAGE_MCP_TOKEN"
+```
+
+Local, run from the repository:
+
+```sh
+claude mcp add sillage -- sillage mcp --root .
+```
+
+Or check a project-scoped `.mcp.json` into the repository:
+
+```json
+{
+  "mcpServers": {
+    "sillage": {
+      "type": "http",
+      "url": "https://sillage.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${SILLAGE_MCP_TOKEN}" }
+    },
+    "sillage-local": { "command": "sillage", "args": ["mcp", "--root", "."] }
+  }
+}
+```
+
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.sillage]
+url = "https://sillage.example.com/mcp"
+bearer_token_env_var = "SILLAGE_MCP_TOKEN"
+
+[mcp_servers.sillage-local]
+command = "sillage"
+args = ["mcp", "--root", "."]
+```
+
+**Cursor** (`.cursor/mcp.json`, or `~/.cursor/mcp.json` for all projects):
+
+```json
+{
+  "mcpServers": {
+    "sillage": {
+      "url": "https://sillage.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${env:SILLAGE_MCP_TOKEN}" }
+    },
+    "sillage-local": { "command": "sillage", "args": ["mcp", "--root", "${workspaceFolder}"] }
+  }
+}
+```
+
+**T3 Code** runs Claude Code and Codex sessions, and each session loads its provider's MCP configuration. Register sillage for the providers you use: the Claude Code `.mcp.json` / `claude mcp add` entries above (remote or local) and the Codex `config.toml` tables above. New T3 Code threads in that project then get the six tools.
+
+### Deployment
+
+**Docker.** With no corpus flags, the image serves the mounted `/workspace`:
+
+```sh
+docker build -t sillage .
+docker run -d --name sillage -p 8765:8765 -e SILLAGE_MCP_TOKEN \
+  -v "$HOME/src/app:/workspace:ro" sillage \
+  serve --host 0.0.0.0 --port 8765 --refresh-interval 120
+```
+
+The image runs as a non-root `sillage` user, exposes 8765 and has a `HEALTHCHECK` on `/healthz`.
+
+**systemd.** [`deploy/sillage.service`](deploy/sillage.service) is a hardened unit (`ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`, no capabilities). It reads the token from `/etc/sillage/sillage.env`. Install steps are in the unit's header comment. For anything beyond localhost, put a TLS-terminating reverse proxy in front.
 
 ## Results (Stage 6, n = 1000, bootstrap 1000)
 

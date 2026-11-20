@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-use sillage_core::{FeatureBag, Lang, MethodId, MethodRecord, SimplifiedTree, lang_compatible};
+use sillage_core::{FeatureBag, Lang, MethodId, MethodRecord, Params, SimplifiedTree, lang_compatible};
 
 use crate::filter::CompiledFilter;
 use crate::{
@@ -180,6 +180,19 @@ impl Engine {
     /// excluded ids and excluded paths are applied in Phase I before the η1
     /// cut, so they never take an N2, cluster, dedup or top-k slot.
     pub fn recommend_filtered(&self, lang: Lang, snippet: &str, filter: &QueryFilter) -> anyhow::Result<Output> {
+        self.recommend_filtered_with(lang, snippet, filter, &self.params)
+    }
+
+    /// [`recommend_filtered`](Self::recommend_filtered) with per-call
+    /// parameters instead of [`Engine::params`] (e.g. a shared engine serving
+    /// both the repo preset and the paper defaults).
+    pub fn recommend_filtered_with(
+        &self,
+        lang: Lang,
+        snippet: &str,
+        filter: &QueryFilter,
+        params: &Params,
+    ) -> anyhow::Result<Output> {
         let featurizer = self.featurizer.as_ref();
         let start = Instant::now();
         let compiled = self.compile(filter);
@@ -192,7 +205,7 @@ impl Engine {
         // first η2 candidates with score > τ1, a prefix of the ranking), so N2
         // is computed only that far.
         let t = Instant::now();
-        let hits = self.index.search_bounded_where(&fq, self.params.eta1, |id| self.admissible(lang, compiled.as_ref(), id));
+        let hits = self.index.search_bounded_where(&fq, params.eta1, |id| self.admissible(lang, compiled.as_ref(), id));
         let phase1_ms = ms(t);
 
         let t = Instant::now();
@@ -201,8 +214,8 @@ impl Engine {
             &fq,
             &fq_full,
             hits,
-            self.params.eta2,
-            Some(self.params.tau1),
+            params.eta2,
+            Some(params.tau1),
             featurizer,
             |id| self.load_tree(id),
             |id| full.bound(id),
@@ -210,13 +223,13 @@ impl Engine {
         let phase2_ms = ms(t);
 
         let t = Instant::now();
-        let mut clusters = cluster_scored(&fq, &n2, &self.params, featurizer);
-        clusters.truncate(self.params.k);
+        let mut clusters = cluster_scored(&fq, &n2, params, featurizer);
+        clusters.truncate(params.k);
         let recommendations: Vec<Recommendation> = clusters
             .into_par_iter()
             .map(|c| {
-                let mut tree = intersect(&c.tuple, &fq, &n2, &self.params, featurizer);
-                if self.params.complete_calls && c.tuple.len() > 1 {
+                let mut tree = intersect(&c.tuple, &fq, &n2, params, featurizer);
+                if params.complete_calls && c.tuple.len() > 1 {
                     tree = complete_calls(&tree, &n2[c.tuple[0]].tree);
                 }
                 let query_match = prune(&fq, &tree, &featurizer.featurize(&tree)).keep;

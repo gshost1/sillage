@@ -7,6 +7,7 @@ members = [
     "crates/sillage-engine",
     "crates/sillage-render",
     "crates/sillage-bench",
+    "crates/sillage-mcp",
     "crates/sillage-cli",
 ]
 
@@ -25,6 +26,7 @@ sillage-index = { path = "crates/sillage-index" }
 sillage-engine = { path = "crates/sillage-engine" }
 sillage-render = { path = "crates/sillage-render" }
 sillage-bench = { path = "crates/sillage-bench" }
+sillage-mcp = { path = "crates/sillage-mcp" }
 
 # Parsing
 tree-sitter = "0.25"
@@ -52,6 +54,14 @@ rand = "0.9"
 rand_chacha = "0.9"
 anyhow = "1.0"
 thiserror = "2.0"
+
+# MCP server
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-std", "io-util"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+subtle = "2.6"
+getrandom = "0.3"
 
 # Dev / tests
 proptest = "1.6"

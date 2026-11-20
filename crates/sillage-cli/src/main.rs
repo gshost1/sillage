@@ -95,6 +95,81 @@ pub enum Command {
         #[command(subcommand)]
         bench: BenchCommand,
     },
+    /// Serve the agent tools over MCP Streamable HTTP (web-hosted).
+    Serve {
+        /// Address to bind (use 0.0.0.0 to accept remote connections).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// Require `Authorization: Bearer <TOKEN>` on /mcp. Defaults to
+        /// $SILLAGE_MCP_TOKEN; prefer the variable (arguments show up in `ps`).
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+        /// Browser origin allowed to call /mcp (repeatable; `*` for any).
+        /// Requests without an Origin header (CLI agents) are always allowed.
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origins: Vec<String>,
+        /// Largest accepted request body.
+        #[arg(long, default_value_t = sillage_mcp::http::DEFAULT_MAX_BODY_BYTES, value_parser = parse_positive)]
+        max_body_bytes: usize,
+        #[command(flatten)]
+        corpora: McpCorpusArgs,
+    },
+    /// Serve the agent tools over MCP stdio (launched by a local agent).
+    Mcp {
+        #[command(flatten)]
+        corpora: McpCorpusArgs,
+    },
+}
+
+/// Corpora served by `sillage serve` / `sillage mcp`.
+#[derive(Debug, Args, Default)]
+pub struct McpCorpusArgs {
+    /// A named corpus: a directory (indexed live) or a prebuilt `.sil` file
+    /// (repeatable).
+    #[arg(long = "corpus", value_name = "NAME=PATH", value_parser = parse_corpus_spec)]
+    pub corpora: Vec<sillage_mcp::CorpusSpec>,
+    /// A directory served as a corpus named after its basename (default:
+    /// the current directory when no --corpus is given).
+    #[arg(long, value_name = "DIR")]
+    pub root: Option<PathBuf>,
+    /// Corpus used when a tool call names none (default: --root, else the
+    /// first --corpus).
+    #[arg(long, value_name = "NAME")]
+    pub default_corpus: Option<String>,
+    /// Languages indexed in directory corpora (comma-separated or repeated;
+    /// default: all).
+    #[arg(long = "lang", value_parser = parse_lang, value_delimiter = ',')]
+    pub langs: Vec<Lang>,
+    /// Re-index directory corpora incrementally every N seconds (0: only on
+    /// `refresh_corpus`).
+    #[arg(long, value_name = "SECS", default_value_t = 0)]
+    pub refresh_interval: u64,
+}
+
+fn parse_corpus_spec(s: &str) -> Result<sillage_mcp::CorpusSpec, String> {
+    sillage_mcp::CorpusSpec::parse(s).map_err(|e| e.to_string())
+}
+
+impl McpCorpusArgs {
+    fn load_options(&self) -> sillage_mcp::LoadOptions {
+        sillage_mcp::LoadOptions {
+            corpora: self.corpora.clone(),
+            root: self.root.clone(),
+            default_corpus: self.default_corpus.clone(),
+            langs: self.langs.clone(),
+        }
+    }
+
+    fn refresh(&self) -> Option<std::time::Duration> {
+        (self.refresh_interval > 0).then(|| std::time::Duration::from_secs(self.refresh_interval))
+    }
+}
+
+/// `--token`, else `$SILLAGE_MCP_TOKEN`; blank means none.
+fn resolve_token(flag: Option<String>) -> Option<String> {
+    flag.or_else(|| std::env::var(sillage_mcp::TOKEN_ENV).ok()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 #[derive(Debug, Subcommand)]
@@ -593,6 +668,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Explain { input } => cmd_explain(&input),
         Command::Stats { index } => cmd_stats(&index),
+        Command::Serve { host, port, token, cors_origins, max_body_bytes, corpora } => {
+            let http = sillage_mcp::HttpConfig {
+                token: resolve_token(token),
+                cors_origins,
+                max_body_bytes,
+                ..sillage_mcp::HttpConfig::default()
+            };
+            let opts = sillage_mcp::ServeOptions { host, port, http, refresh_interval: corpora.refresh() };
+            sillage_mcp::run_http(corpora.load_options(), opts)
+        }
+        Command::Mcp { corpora } => sillage_mcp::run_stdio(corpora.load_options(), corpora.refresh()),
         Command::Bench { bench } => match bench {
             BenchCommand::Recall { index, n, mode, bootstrap, seed, json, params } => {
                 let engine = load_engine(&index, params.to_params())?;
@@ -732,6 +818,42 @@ mod tests {
             Command::Explain { input } => assert!(input.resolve_lang().is_err()),
             c => panic!("{c:?}"),
         }
+    }
+
+    #[test]
+    fn parses_serve_and_mcp() {
+        match parse(&[
+            "serve", "--host", "0.0.0.0", "--port", "9000", "--corpus", "a=/x", "--corpus", "b=/y.sil", "--root", "/r",
+            "--cors-origin", "https://app.example", "--max-body-bytes", "1024", "--refresh-interval", "30", "--lang", "go,rust",
+            "--default-corpus", "b",
+        ]) {
+            Command::Serve { host, port, token, cors_origins, max_body_bytes, corpora } => {
+                assert_eq!((host.as_str(), port, token, max_body_bytes), ("0.0.0.0", 9000, None, 1024));
+                assert_eq!(cors_origins, ["https://app.example"]);
+                let names: Vec<&str> = corpora.corpora.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(names, ["a", "b"]);
+                assert_eq!(corpora.root.as_deref(), Some(Path::new("/r")));
+                assert_eq!(corpora.langs, [Lang::Go, Lang::Rust]);
+                assert_eq!(corpora.default_corpus.as_deref(), Some("b"));
+                assert_eq!(corpora.refresh(), Some(std::time::Duration::from_secs(30)));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&["mcp", "--root", "."]) {
+            Command::Mcp { corpora } => {
+                assert_eq!(corpora.root.as_deref(), Some(Path::new(".")));
+                assert_eq!(corpora.refresh(), None);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from(["sillage", "mcp", "--corpus", "no-equals"]).is_err());
+        assert!(Cli::try_parse_from(["sillage", "mcp", "--corpus", "bad name=/x"]).is_err());
+    }
+
+    #[test]
+    fn token_flag_overrides_env_and_blank_is_none() {
+        assert_eq!(resolve_token(Some("  t0k ".into())).as_deref(), Some("t0k"));
+        assert_eq!(resolve_token(Some("   ".into())), None);
     }
 
     #[test]

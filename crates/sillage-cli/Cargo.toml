@@ -15,6 +15,7 @@ sillage-index.workspace = true
 sillage-engine.workspace = true
 sillage-render.workspace = true
 sillage-bench.workspace = true
+sillage-mcp.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
