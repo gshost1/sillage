@@ -43,8 +43,16 @@ sillage-render  sillage-bench
 5. **Phase I vs Phases II–III:** Phase I uses set semantics (`S(F)`); Phases II and III use multiset semantics (`F`).
 6. **`τ1` threshold:** Applied to `SimScore(F(q), F(Prune(F(q), m))) / |F(q)|` (default `0.65`).
 7. **Features inside vs after `Prune`:** Inside `Prune`, `F(n)` is each leaf's feature bag in the original `m2`. Whenever the paper writes `F(mp)` (`csq`, `Intersect`), the pruned tree is built and re-featurized.
-8. **Free identifiers in query snippets:** Undeclared identifiers in value position in a snippet count as locals (`#VAR`), matching Fig. 4 (`view`). Callees, members, types, and builtins do not. In full methods, undeclared names remain globals.
+8. **Free identifiers (revised in Stage 2):** Undeclared identifiers in value position count as locals (`#VAR`), matching Fig. 4 (`view`), in query snippets **and** in corpus methods. Callees, members, types, labels, capitalised names and builtins do not. (The original asymmetric rule made every field read `#VAR` in a query but stay a global in its method; fixing it raised contiguous Recall@1 by ~6.5 points.)
 9. **Recall@1 hit:** Counts as a hit when the original method is ranked first, OR when the top result's pruned similarity equals the original's (matching Section 5's "100% similar" clause).
+10. **Corpus trees are method bodies:** a method is parsed whole (so parameters scope as locals) but its tree is the body subtree (`parse_method(lang, text, body)`); signatures never reach features or recommendations.
+11. **C-style `for` headers** are grouped into one `#;#;#` node (`for(#)#`, Fig. 4) and a declaration initialiser's own `;` is hoisted into it (`int#`, Table 2).
+12. **Size-1 clusters** recommend the full method body (`Singleton::FullBody`, §4.3.5) rather than §3.3.3's `Prune(F(q), N2(i1))` (`Singleton::PrunedToQuery`).
+13. **Cluster growth ties:** only the earliest maximiser extends a tuple (`ClusterTies::First`); the literal all-maximisers rule (`ClusterTies::All`) is exponential on repetitive code and is capped at `MAX_TUPLES`.
+14. **Statement-sequence normalisation:** a parent / usage context whose label is a statement sequence (`{###}` or brace-less `###`) is featurized as `(n, 0, {#})` (`AromaFeaturizer`); `PaperFeaturizer` keeps literal labels.
+15. **Partial snippets:** missing closers (`)`, `]`, `}`) are appended and kept as zero-width keywords, as are tree-sitter `MISSING` tokens; interpolated strings (JS templates, f-strings) are lowered structurally.
+16. **Rendering:** a recommendation's outer body braces are not shown; token-less subtrees (`{}`, `[]`) survive pruning; a dropped callee / member name of a kept call is restored (`Params::complete_calls`).
+17. **§5 sampling** counts code lines only (lines touched by a terminal of the parsed body), so comment lines never form queries.
 
 ## Work Slices
 

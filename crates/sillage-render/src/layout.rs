@@ -197,6 +197,32 @@ fn needs_space(prev: Option<char>, next: Option<char>, gap: &str) -> bool {
     gap.starts_with(char::is_whitespace) || gap.ends_with(char::is_whitespace)
 }
 
+/// Whether `gap` holds anything besides whitespace and comments (`//`, `/* */`,
+/// or `#` for Python).
+fn gap_has_code(gap: &str, lang: sillage_core::Lang) -> bool {
+    let b = gap.as_bytes();
+    let py = lang == sillage_core::Lang::Python;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if py && c == b'#' || !py && c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if !py && c == b'/' && b.get(i + 1) == Some(&b'*') {
+            match gap[i + 2..].find("*/") {
+                Some(k) => i += k + 4,
+                None => return true,
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
 /// Lays out `tree` against `query_match` (aligned with `tree.leaves`).
 pub fn layout(tree: &SimplifiedTree, query_match: &[bool], query: Option<&str>) -> Layout {
     let src: &str = &tree.source;
@@ -230,7 +256,9 @@ pub fn layout(tree: &SimplifiedTree, query_match: &[bool], query: Option<&str>) 
             }
             Some(pe) => {
                 let gap = &src[pe..start];
-                let dropped = !gap.trim().is_empty();
+                // Comments are not tree nodes: a gap holding only comments and
+                // whitespace dropped no code, so it is copied verbatim.
+                let dropped = gap_has_code(gap, tree.lang);
                 if !dropped {
                     // Pure whitespace: copy verbatim, splitting on newlines.
                     let mut parts = gap.split('\n');

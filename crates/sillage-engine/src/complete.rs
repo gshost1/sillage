@@ -4,16 +4,16 @@
 //! and every feature of a non-variable token embeds the token text. Two calls that
 //! differ only in the callee (`setupUI(x)` vs `setupUIToHideKeyBoardOnTouch(x)`)
 //! therefore keep the argument but drop the callee, rendering `(x)`. This pass
-//! restores, from the first cluster member, a dropped token that is the direct
-//! child of a kept node and sits right before `(` (callee, constructed type) or
-//! right after `.` (member name).
+//! restores, from the first cluster member, a small dropped child (at most
+//! [`MAX_HOLE_TOKENS`] tokens) of a kept node that sits next to one of the node's
+//! keywords: a callee before `(`, a receiver or member around `.`, the type after
+//! `instanceof` / `new` / in a cast, so the rendering has no syntactic holes.
 
 use rustc_hash::FxHashSet;
 use sillage_core::{NodeKind, SimplifiedTree, Span};
 
-fn is_kw(tree: &SimplifiedTree, id: u32, s: &str) -> bool {
-    matches!(&tree.node(id).kind, NodeKind::Keyword { text } if &**text == s)
-}
+/// Largest dropped child (in tokens) the completion pass restores.
+pub const MAX_HOLE_TOKENS: usize = 3;
 
 /// `rec` must be derived from `base` by `retain` (spans are shared). Returns `rec`
 /// unchanged when nothing needs restoring.
@@ -45,16 +45,38 @@ pub fn complete_calls(rec: &SimplifiedTree, base: &SimplifiedTree) -> Simplified
             continue;
         }
         for (k, &c) in n.children.iter().enumerate() {
-            let li = leaf_pos[c as usize];
-            if li == usize::MAX || keep[li] {
+            let child = &base.nodes[c as usize];
+            if child.kind.is_keyword() || live[c as usize] {
                 continue;
             }
-            let before_paren = n.children.get(k + 1).is_some_and(|&nx| is_kw(base, nx, "("));
-            let after_dot = k > 0 && is_kw(base, n.children[k - 1], ".");
-            if before_paren || after_dot {
-                keep[li] = true;
-                added = true;
+            // Statement / element delimiters do not mark a hole: a dropped statement
+            // next to a block's `{` or a dropped list element is a real removal.
+            let anchor = |x: u32| match &base.node(x).kind {
+                NodeKind::Keyword { text } => !matches!(&**text, "{" | "}" | ";" | ","),
+                _ => false,
+            };
+            let next_kw = n.children.get(k + 1).is_some_and(|&x| anchor(x));
+            let prev_kw = k > 0 && anchor(n.children[k - 1]);
+            if !(next_kw || prev_kw) {
+                continue;
             }
+            // Leaves of the dropped child; restore only small holes.
+            let mut leaves = Vec::new();
+            let mut stack = vec![c];
+            while let Some(x) = stack.pop() {
+                let xn = &base.nodes[x as usize];
+                if xn.kind.is_token() {
+                    leaves.push(leaf_pos[x as usize]);
+                }
+                stack.extend(xn.children.iter().copied());
+            }
+            if leaves.is_empty() || leaves.len() > MAX_HOLE_TOKENS {
+                continue;
+            }
+            for li in leaves {
+                keep[li] = true;
+            }
+            added = true;
         }
     }
     if added { base.retain(&keep) } else { rec.clone() }

@@ -554,3 +554,23 @@ fn all_languages_end_to_end() {
     assert_eq!(Lang::Python.placeholder(), "...");
     assert_eq!(Lang::Go.placeholder(), "// ...");
 }
+
+/// Comments are not tree nodes: rendering a full body keeps them verbatim (no
+/// `// ...` placeholder), while a dropped code line still becomes one, even when
+/// it starts like a comment continuation (`*deref`).
+#[test]
+fn comments_render_verbatim_and_drops_use_placeholders() {
+    let src = "fn f(m: &mut HashMap<u32, u32>, k: u32) {\n    // count it\n    let v = 1;\n    *m.entry(k).or_insert(0) += v;\n    /* block\n     * comment */\n    log(v);\n}\n";
+    let ms = sillage_parse::extract_methods(Lang::Rust, src);
+    let t = &ms[0].tree;
+    let all = vec![true; t.leaves.len()];
+    let out = render(t, &all, None, Style::Plain);
+    // (A comment before the first terminal lies outside the rendered range.)
+    assert_eq!(out, "let v = 1;\n*m.entry(k).or_insert(0) += v;\n/* block\n * comment */\nlog(v);\n");
+    assert!(layout(t, &all, None).lines.iter().all(|l| !l.placeholder));
+    // Drop the `*m.entry(...)` statement.
+    let keep: Vec<bool> = t.leaves.iter().map(|&l| !matches!(t.label(l), "m" | "entry" | "k" | "or_insert" | "0") && !(t.label(l) == "v" && t.node(l).span.start > 60)).collect();
+    let pruned = t.retain(&keep);
+    let out = render(&pruned, &vec![true; pruned.leaves.len()], None, Style::Plain);
+    assert!(out.contains("// ...") && !out.contains("entry"), "{out}");
+}
